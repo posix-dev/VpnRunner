@@ -1,0 +1,14 @@
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+build/
+
+# IDE
+.idea/
+*.iml
+
+# Локальные настройки (путь к SDK)
+local.properties
+
+# macOS
+.DS_Store
