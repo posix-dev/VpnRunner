@@ -10,7 +10,9 @@ import java.time.Duration
 
 /**
  * Порядок Run: подписки → Cisco (openconnect) → ждём подключения → sing-box с правилами.
- * Порядок Stop: sing-box → Cisco.
+ * Из-за рубежа: подписки → российский VPN (цепочка) и kill switch → проверка, что выход в России →
+ * Cisco через цепочку → sing-box с правилами.
+ * Порядок Stop: sing-box → Cisco → цепочка и kill switch.
  * Все методы блокирующие — вызывать из фонового потока.
  */
 class VpnController(
@@ -20,6 +22,12 @@ class VpnController(
 ) {
     @Volatile var lastCiscoState: CiscoState? = null
         private set
+    /** Из-за рубежа: через какой адрес мы видны снаружи («95.1.2.3, Москва, RU»). */
+    @Volatile var lastExit: String? = null
+        private set
+    /** Из-за рубежа: с чем запущен основной sing-box (нужно, чтобы применить правила без перезапуска). */
+    @Volatile private var lastAbroad: Abroad.Plan? = null
+    @Volatile private var lastRuServers: List<Server> = emptyList()
 
     private val http = HttpClient.newBuilder()
         .proxy(java.net.ProxySelector.of(null))
@@ -74,10 +82,44 @@ class VpnController(
 
         backend.prepare()
         lastCiscoState = null
+        lastExit = null
+        lastAbroad = null
 
-        val cisco = if (settings.cisco.enabled) prepareCisco(settings) else null
-        log(if (cisco != null) "Подключаю Cisco (${settings.cisco.server})…" else "Cisco выключен — только VPN")
-        backend.start(cisco, singbox)
+        val abroad = settings.abroad.enabled
+        var plan: Abroad.Plan? = null
+        var vpnServers = servers
+        var chain: ChainLaunch? = null
+        if (abroad) {
+            val found = Abroad.ruServers(settings, servers)
+            check(found.isNotEmpty()) {
+                "Не нашёл российских серверов: ни в одном названии нет 🇷🇺, RU или «Россия». " +
+                    "Выберите сервер вручную во вкладке «Из-за рубежа»"
+            }
+            log("Из-за рубежа: российский VPN — " + if (found.size == 1) "«${found[0].name}»" else "самый быстрый из ${found.size} российских серверов")
+            val pinned = resolveServers(found)
+            // Без адреса сервер не подключить: его имя пришлось бы спрашивать у DNS, который идёт через него же
+            val ru = found.filter { (it.outbound["server"] as? String)?.trim()?.let { h -> Abroad.isIpv4(h) || h in pinned } == true }
+            check(ru.isNotEmpty()) { "Не удалось узнать адрес российского сервера — проверьте интернет и нажмите Run ещё раз" }
+            val ips = (pinned.values.flatten() + ru.mapNotNull { (it.outbound["server"] as? String)?.takeIf(Abroad::isIpv4) }).distinct()
+            plan = Abroad.Plan(ips, pinned, settings.abroad.allViaRu)
+            vpnServers = ru
+            backend.chainConfig.writeText(Json.write(SingBoxConfig.buildChain(settings, ru, pinned)))
+            val ks = when {
+                !settings.abroad.killSwitch -> null
+                Platform.os != Os.MAC -> { log("⚠ Kill switch пока есть только на macOS. Cisco всё равно подключается только через российский VPN"); null }
+                else -> KillSwitch(ips, allowRoot = !settings.abroad.allViaRu || settings.rules.any { it.mode == RuleMode.DIRECT })
+            }
+            chain = ChainLaunch(ks)
+            log("Подключаю российский VPN" + if (ks != null) " (kill switch включён: без него интернета не будет)…" else "…")
+        }
+
+        val cisco = if (settings.cisco.enabled) prepareCisco(settings, proxy = if (abroad) "http://127.0.0.1:${SingBoxConfig.CHAIN_PORT}" else null) else null
+        if (!abroad) log(if (cisco != null) "Подключаю Cisco (${settings.cisco.server})…" else "Cisco выключен — только VPN")
+        backend.start(cisco, singbox, chain) {
+            waitForChain()
+            checkExit()
+            log(if (cisco != null) "Подключаю Cisco (${settings.cisco.server}) через российский VPN…" else "Cisco выключен — только российский VPN")
+        }
 
         var state: CiscoState? = null
         if (cisco != null) {
@@ -96,17 +138,121 @@ class VpnController(
             onCiscoUp()
         }
 
-        ruleSetFiles = if (settings.russiaDirect) downloadRuleSets() else emptyMap()
-        val cfg = SingBoxConfig.build(settings, servers, state, backend.runDir.path, ruleSetFiles)
+        val needRuleSets = if (plan != null) !plan.allViaRu else settings.russiaDirect
+        // Из-за рубежа (под kill switch) напрямую не скачать — качаем через российский VPN
+        ruleSetFiles = if (needRuleSets) downloadRuleSets(viaChain = plan != null) else emptyMap()
+        val cfg = SingBoxConfig.build(settings, vpnServers, state, backend.runDir.path, ruleSetFiles, plan)
         backend.singboxConfig.writeText(Json.write(cfg))
         log("Запускаю VPN (sing-box)…")
         backend.startSingBox()
         waitForSingBox()
+        lastAbroad = plan
+        lastRuServers = vpnServers
         if (state != null) checkWorkDns(state)
-        log("Готово: VPN работает. Российские сайты ${if (settings.russiaDirect) "идут напрямую" else "идут через VPN"}.")
+        log(when {
+            plan == null -> "Готово: VPN работает. Российские сайты ${if (settings.russiaDirect) "идут напрямую" else "идут через VPN"}."
+            plan.allViaRu -> "Готово: весь трафик идёт через российский VPN" + (lastExit?.let { " ($it)" } ?: "") + "."
+            else -> "Готово: Cisco и российские сайты идут через российский VPN" + (lastExit?.let { " ($it)" } ?: "") + ", остальное — напрямую."
+        })
     }
 
-    private fun prepareCisco(settings: AppSettings): CiscoLaunch {
+    // ---- из-за рубежа ----
+
+    /**
+     * Адреса российских серверов, у которых в подписке имя, а не IP. Нужны заранее: для kill switch и чтобы
+     * sing-box не спрашивал про них DNS. Спрашиваем через DNS-over-HTTPS (местный провайдер имён не видит),
+     * не вышло — берём адреса с прошлого раза, и только потом системный DNS.
+     */
+    private fun resolveServers(ru: List<Server>): Map<String, List<String>> {
+        val cacheFile = File(Platform.appDir, "cache/ru-hosts.json")
+        val cached = runCatching { Json.parse(cacheFile.readText()).obj().mapValues { (_, v) -> v.arr().map { it.toString() } } }.getOrDefault(emptyMap())
+        val hosts = ru.mapNotNull { it.outbound["server"] as? String }.map { it.trim() }.filter { it.isNotEmpty() && !Abroad.isIpv4(it) && !it.contains(':') }.distinct()
+        val out = LinkedHashMap<String, List<String>>()
+        for (h in hosts) {
+            val ips = dohResolve(h)
+                ?: cached[h]?.takeIf { it.isNotEmpty() }?.also { log("Адрес $h не узнать через DNS-over-HTTPS — беру сохранённый") }
+                ?: runCatching { java.net.InetAddress.getAllByName(h).mapNotNull { it.hostAddress }.filter(Abroad::isIpv4) }.getOrNull()
+                    ?.takeIf { it.isNotEmpty() }?.also { log("⚠ Адрес $h узнал через обычный DNS") }
+            if (ips == null) log("⚠ Не удалось узнать адрес сервера $h") else out[h] = ips
+        }
+        runCatching {
+            cacheFile.parentFile.mkdirs()
+            cacheFile.writeText(Json.write(cached + out, pretty = false))
+        }
+        return out
+    }
+
+    private fun dohResolve(host: String): List<String>? {
+        val urls = listOf("https://1.1.1.1/dns-query", "https://8.8.8.8/resolve")
+        for (u in urls) {
+            val r = runCatching {
+                val req = HttpRequest.newBuilder(URI("$u?name=${enc(host)}&type=A")).header("Accept", "application/dns-json")
+                    .timeout(Duration.ofSeconds(5)).GET().build()
+                val body = http.send(req, HttpResponse.BodyHandlers.ofString()).body()
+                Json.parse(body).obj()["Answer"].arr().map { it.obj() }.filter { it.str("type") == "1" }.mapNotNull { it.str("data") }.filter(Abroad::isIpv4)
+            }.getOrNull()
+            if (!r.isNullOrEmpty()) return r
+        }
+        return null
+    }
+
+    private val chainHttp by lazy {
+        HttpClient.newBuilder()
+            .proxy(java.net.ProxySelector.of(java.net.InetSocketAddress("127.0.0.1", SingBoxConfig.CHAIN_PORT)))
+            .connectTimeout(Duration.ofSeconds(5)).build()
+    }
+
+    private fun waitForChain(timeoutMs: Long = 20_000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        Thread.sleep(500)
+        while (System.currentTimeMillis() < deadline) {
+            if (clashGet("/version", SingBoxConfig.CHAIN_CLASH_API) != null) return
+            if (!backend.chainAlive() && System.currentTimeMillis() > deadline - timeoutMs + 3000) break
+            Thread.sleep(300)
+        }
+        val tail = runCatching { backend.chainLog.readLines().takeLast(6).joinToString("\n— ") }.getOrDefault("")
+        throw IllegalStateException("Российский VPN (sing-box) не запустился.\n— $tail")
+    }
+
+    /**
+     * Проверка по факту: через цепочку мы видны с российского адреса. Если сервис сказал, что не из России, —
+     * Cisco не подключаем (он увидел бы чужую страну). Если не ответил ни один — значит, российский сервер
+     * не работает: тоже не подключаем.
+     */
+    private fun checkExit() {
+        data class Exit(val ip: String, val country: String, val city: String)
+        val checks: List<Pair<String, (Map<String, Any?>) -> Exit?>> = listOf(
+            "https://ipinfo.io/json" to { m -> m.str("country")?.let { Exit(m.str("ip") ?: "?", it, m.str("city") ?: "") } },
+            "https://ifconfig.co/json" to { m -> m.str("country_iso")?.let { Exit(m.str("ip") ?: "?", it, m.str("city") ?: "") } },
+            "http://ip-api.com/json/?fields=status,countryCode,city,query" to { m -> m.str("countryCode")?.let { Exit(m.str("query") ?: "?", it, m.str("city") ?: "") } },
+        )
+        var exit: Exit? = null
+        for (attempt in 1..2) {
+            for ((url, parse) in checks) {
+                exit = runCatching {
+                    val req = HttpRequest.newBuilder(URI(url)).header("Accept", "application/json").header("User-Agent", "curl/8")
+                        .timeout(Duration.ofSeconds(8)).GET().build()
+                    val r = chainHttp.send(req, HttpResponse.BodyHandlers.ofString())
+                    if (r.statusCode() == 200) parse(Json.parse(r.body()).obj()) else null
+                }.getOrNull()
+                if (exit != null) break
+            }
+            if (exit != null) break
+            Thread.sleep(1500)
+        }
+        val e = exit ?: throw IllegalStateException(
+            "Российский VPN не работает: через него не открывается ни один сайт. Выберите другой сервер во вкладке «Из-за рубежа». " +
+                "Подробности — в журнале sing-box (цепочка: ${backend.chainLog.path})"
+        )
+        val where = listOf(e.ip, e.city, e.country).filter { it.isNotBlank() }.joinToString(", ")
+        check(e.country.equals("RU", true)) {
+            "Выход российского VPN — не в России ($where). Cisco не подключаю: он увидел бы эту страну. Выберите другой сервер во вкладке «Из-за рубежа»"
+        }
+        lastExit = where
+        log("Российский VPN работает: снаружи видно $where")
+    }
+
+    private fun prepareCisco(settings: AppSettings, proxy: String? = null): CiscoLaunch {
         val c = settings.cisco
         check(c.server.isNotBlank()) { "Укажите адрес сервера Cisco" }
         check(c.user.isNotBlank()) { "Укажите логин Cisco" }
@@ -148,6 +294,12 @@ class VpnController(
                 add("--token-secret=@${tokenFile.path}")
             }
             add("--reconnect-timeout=60")
+            if (proxy != null) {
+                // Только через российский VPN: с --proxy openconnect не ходит к серверу напрямую никогда,
+                // а UDP (DTLS) через прокси не идёт — без --no-dtls он пошёл бы напрямую.
+                add("--proxy=$proxy")
+                add("--no-dtls")
+            }
             add(c.server)
         }
         pendingTokenFile = if (useToken) tokenFile else null
@@ -227,9 +379,18 @@ class VpnController(
                 "сервер спрашивает код отдельным полем — выключите во вкладке Cisco «Код вводится вместе с паролем»"
             text.contains("User input required", true) && !hasTotp ->
                 "сервер спрашивает второй пароль (код) — сохраните во вкладке Cisco секрет Google Authenticator"
-            text.contains("Certificate from VPN server", true) || text.contains("verify failed", true) ->
+            // «Server certificate verify failed» openconnect пишет и тогда, когда отпечаток указан и совпал, —
+            // настоящий отказ только «Certificate from VPN server … failed verification».
+            text.contains("Certificate from VPN server", true) ->
                 "сертификат сервера не прошёл проверку — укажите его отпечаток (pin-sha256) во вкладке Cisco"
             text.contains("Failed to open tun", true) || text.contains("Failed to open TUN", true) -> "не удалось создать сетевой интерфейс"
+            c.server.isNotBlank() && text.contains("proxy", true) && (text.contains("fail", true) || text.contains("error", true)) ->
+                "не удалось подключиться к серверу через российский VPN — проверьте адрес сервера; если не поможет, выберите другой российский сервер"
+            text.contains("Can't assign requested address", true) ->
+                "не удалось соединиться с сервером Cisco: к нему остался маршрут через сеть, к которой Mac уже не подключён. " +
+                    "Нерабочие маршруты убираются при остановке — нажмите Run ещё раз"
+            text.contains("Failed to connect to host", true) ->
+                "не удалось соединиться с сервером Cisco — проверьте интернет и адрес сервера"
             else -> "подробности в журнале Cisco"
         }
         log("Журнал Cisco (последние строки):")
@@ -293,7 +454,8 @@ class VpnController(
      * это sing-box, он качает их при старте через ещё не проверенный сервер и падает, когда тот не работает.
      * Обновляем раз в 3 дня; не скачалось — берём старую копию, а без неё sing-box попробует сам через VPN.
      */
-    private fun downloadRuleSets(): Map<String, String> {
+    private fun downloadRuleSets(viaChain: Boolean = false): Map<String, String> {
+        val http = if (viaChain) chainHttp else this.http
         val dir = File(Platform.appDir, "rules").apply { mkdirs() }
         val files = LinkedHashMap<String, String>()
         for ((tag, url) in SingBoxConfig.RULE_SETS) {
@@ -328,8 +490,10 @@ class VpnController(
 
     /** Пересобрать конфиг с новыми правилами и перезапустить только sing-box. */
     fun applyRules(settings: AppSettings, servers: List<Server>) {
-        if (settings.russiaDirect && ruleSetFiles.isEmpty()) ruleSetFiles = downloadRuleSets()
-        val cfg = SingBoxConfig.build(settings, servers, lastCiscoState, backend.runDir.path, ruleSetFiles)
+        val plan = lastAbroad
+        val needRuleSets = if (plan != null) !plan.allViaRu else settings.russiaDirect
+        if (needRuleSets && ruleSetFiles.isEmpty()) ruleSetFiles = downloadRuleSets(viaChain = plan != null)
+        val cfg = SingBoxConfig.build(settings, if (plan != null) lastRuServers else servers, lastCiscoState, backend.runDir.path, ruleSetFiles, plan)
         backend.singboxConfig.writeText(Json.write(cfg))
         backend.reloadSingBox()
         log("Правила применены")
@@ -339,10 +503,12 @@ class VpnController(
         log("Останавливаю…")
         backend.stop()
         lastCiscoState = null
+        lastExit = null
+        lastAbroad = null
         log("Остановлено")
     }
 
-    fun isRunning() = backend.singboxAlive() || backend.ciscoAlive()
+    fun isRunning() = backend.singboxAlive() || backend.ciscoAlive() || backend.chainAlive()
 
     // ---- управление запущенным sing-box через Clash API ----
 
@@ -365,8 +531,8 @@ class VpnController(
         return "авто → ${auto ?: "…"}"
     }
 
-    private fun clashGet(path: String): String? = runCatching {
-        val req = HttpRequest.newBuilder(URI("http://${SingBoxConfig.CLASH_API}$path")).timeout(Duration.ofSeconds(2)).GET().build()
+    private fun clashGet(path: String, api: String = SingBoxConfig.CLASH_API): String? = runCatching {
+        val req = HttpRequest.newBuilder(URI("http://$api$path")).timeout(Duration.ofSeconds(2)).GET().build()
         val r = http.send(req, HttpResponse.BodyHandlers.ofString())
         if (r.statusCode() == 200) r.body() else null
     }.getOrNull()

@@ -40,6 +40,20 @@ data class CiscoSettings(
     val otpCombined: Boolean = false,
 )
 
+/**
+ * Режим «из-за рубежа»: Cisco не пускает зарубежные адреса, поэтому сначала поднимается российский VPN,
+ * и Cisco подключается через него — сервер Cisco видит российский адрес.
+ */
+data class AbroadSettings(
+    val enabled: Boolean = false,
+    /** id российского сервера; "auto" — все серверы с 🇷🇺 / RU / Россия в названии, самый быстрый из них. */
+    val ruServer: String = AppSettings.AUTO,
+    /** Весь трафик через российский VPN. false — через него только Cisco и российские сайты, остальное напрямую. */
+    val allViaRu: Boolean = true,
+    /** Оборвался российский VPN — интернета нет, пока он не вернётся (только macOS). */
+    val killSwitch: Boolean = true,
+)
+
 data class AppSettings(
     val subscriptions: List<Subscription> = emptyList(),
     /** id выбранного сервера; "auto" — автовыбор самого быстрого. */
@@ -50,7 +64,24 @@ data class AppSettings(
     val openconnectPath: String = "",
     val vpncScriptPath: String = "",
     val singboxPath: String = "",
+    /** Последний адрес во вкладке «Браузер» — с него она и открывается. */
+    val browserUrl: String = "",
+    /** Следить, чтобы рабочий VPN был включён в рабочее время (по Москве, в будни). */
+    val workHoursEnabled: Boolean = true,
+    val workStart: String = "09:00",
+    val workEnd: String = "18:00",
+    /** Пока VPN включён, не давать компьютеру и экрану засыпать — во сне Cisco отключается. */
+    val keepAwake: Boolean = true,
+    val abroad: AbroadSettings = AbroadSettings(),
+    val gitlab: GitLabSettings = GitLabSettings(),
+    val jira: JiraSettings = JiraSettings(),
 ) {
+    val workHours: WorkHours get() = WorkHours(
+        enabled = workHoursEnabled,
+        start = WorkClock.parseTime(workStart, java.time.LocalTime.of(9, 0)),
+        end = WorkClock.parseTime(workEnd, java.time.LocalTime.of(18, 0)),
+    )
+
     companion object {
         const val AUTO = "auto"
 
@@ -58,6 +89,9 @@ data class AppSettings(
             if (!file.exists()) return AppSettings()
             val m = Json.parse(file.readText()).obj()
             val c = m["cisco"].obj()
+            val a = m["abroad"].obj()
+            val g = m["gitlab"].obj()
+            val j = m["jira"].obj()
             return AppSettings(
                 subscriptions = m["subscriptions"].arr().map { it.obj() }
                     .map { Subscription(it.str("name") ?: "", it.str("url") ?: "") }
@@ -81,6 +115,34 @@ data class AppSettings(
                 openconnectPath = m.str("openconnectPath") ?: "",
                 vpncScriptPath = m.str("vpncScriptPath") ?: "",
                 singboxPath = m.str("singboxPath") ?: "",
+                browserUrl = m.str("browserUrl") ?: "",
+                workHoursEnabled = m.bool("workHoursEnabled", true),
+                workStart = m.str("workStart") ?: "09:00",
+                workEnd = m.str("workEnd") ?: "18:00",
+                keepAwake = m.bool("keepAwake", true),
+                abroad = AbroadSettings(
+                    enabled = a.bool("enabled", false),
+                    ruServer = a.str("ruServer") ?: AUTO,
+                    allViaRu = a.bool("allViaRu", true),
+                    killSwitch = a.bool("killSwitch", true),
+                ),
+                gitlab = GitLabSettings(
+                    enabled = g.bool("enabled", false),
+                    urls = g["urls"].arr().mapNotNull { it?.toString() },
+                ),
+                jira = JiraSettings(
+                    enabled = j.bool("enabled", false),
+                    boardUrl = j.str("boardUrl") ?: "",
+                    dayHours = j.str("dayHours")?.toIntOrNull() ?: 8,
+                    container = j["container"].obj().let { c ->
+                        val key = c.str("issueKey") ?: return@let null
+                        JiraContainer(c.str("sprintId")?.toLongOrNull() ?: 0, c.str("sprintName") ?: "", key, c.str("issueId") ?: "", c.str("since") ?: "")
+                    },
+                    containerHours = j.str("containerHours")?.toIntOrNull() ?: 2,
+                    containerOnlyCisco = j.bool("containerOnlyCisco", true),
+                    attributes = j["attributes"].obj().mapNotNull { (k, v) -> v?.toString()?.let { k to it } }.toMap(),
+                    extraIssues = j["extraIssues"].arr().mapNotNull { it?.toString() },
+                ),
             )
         }
     }
@@ -105,6 +167,33 @@ data class AppSettings(
             "openconnectPath" to openconnectPath,
             "vpncScriptPath" to vpncScriptPath,
             "singboxPath" to singboxPath,
+            "browserUrl" to browserUrl,
+            "workHoursEnabled" to workHoursEnabled,
+            "workStart" to workStart,
+            "workEnd" to workEnd,
+            "keepAwake" to keepAwake,
+            "abroad" to linkedMapOf(
+                "enabled" to abroad.enabled,
+                "ruServer" to abroad.ruServer,
+                "allViaRu" to abroad.allViaRu,
+                "killSwitch" to abroad.killSwitch,
+            ),
+            "gitlab" to linkedMapOf(
+                "enabled" to gitlab.enabled,
+                "urls" to gitlab.urls,
+            ),
+            "jira" to linkedMapOf(
+                "enabled" to jira.enabled,
+                "boardUrl" to jira.boardUrl,
+                "dayHours" to jira.dayHours,
+                "container" to jira.container?.let {
+                    linkedMapOf("sprintId" to it.sprintId, "sprintName" to it.sprintName, "issueKey" to it.issueKey, "issueId" to it.issueId, "since" to it.since)
+                },
+                "containerHours" to jira.containerHours,
+                "containerOnlyCisco" to jira.containerOnlyCisco,
+                "attributes" to jira.attributes,
+                "extraIssues" to jira.extraIssues,
+            ),
         )
         val tmp = File(file.path + ".tmp")
         tmp.writeText(Json.write(m))

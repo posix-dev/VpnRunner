@@ -12,6 +12,8 @@ interface SecretStore {
     companion object {
         const val CISCO_PASSWORD = "cisco-password"
         const val CISCO_TOTP = "cisco-totp-secret"
+        const val GITLAB_TOKEN = "gitlab-token"
+        const val JIRA_TOKEN = "jira-token"
     }
 }
 

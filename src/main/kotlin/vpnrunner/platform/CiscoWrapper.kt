@@ -72,6 +72,8 @@ object CiscoWrapper {
             // Свои рабочие домены — в дополнение к присланным сервером
             appendLine("export CISCO_SPLIT_DNS=\"\${CISCO_SPLIT_DNS:+\$CISCO_SPLIT_DNS,}\"${q(splitDomains.joinToString(","))}")
         }
+        // Через прокси (из-за рубежа) шлюз — 127.0.0.1: при отключении vpnc-script удалил бы маршрут к нему
+        appendLine("case \"\$VPNGATEWAY\" in 127.*|::1) [ \"\$reason\" = disconnect ] && unset VPNGATEWAY ;; esac")
         appendLine("REAL_DNS=\"\$INTERNAL_IP4_DNS\"")
         appendLine("WORK_DOMAINS=\"\$CISCO_DEF_DOMAIN \$(echo \"\$CISCO_SPLIT_DNS\" | tr ',' ' ')\"")
         appendLine("unset INTERNAL_IP4_DNS")
@@ -79,6 +81,9 @@ object CiscoWrapper {
         appendLine()
         appendLine("DIR=\$(dirname \"\$STATE\")")
         appendTakeRoutes(this)
+        appendDropDeadRoutes(this)
+        // Перед (пере)подключением: маршрут к серверу через шлюз прежней сети не даёт поставить новый
+        appendLine("case \"\$reason\" in connect|attempt-reconnect) drop_dead_routes \"\$DIR\" ;; esac")
         appendLine("\"\$ORIG\" \"\$@\"")
         appendLine("RC=\$?")
         // При переподключении openconnect заново ставит маршруты, а другой VPN мог за это время вернуть свои.
@@ -109,6 +114,8 @@ object CiscoWrapper {
         appendLine("    [ -n \"\$gw\" ] && route -n add -net \"\$r\" \"\$gw\" >/dev/null 2>&1")
         appendLine("  done < \"\$DIR/routes-taken\"")
         appendLine("  rm -f \"\$DIR/routes-taken\"")
+        // vpnc-script удаляет маршрут к серверу через шлюз текущей сети; если сеть сменилась — не удаляет
+        appendLine("  drop_dead_routes \"\$DIR\"")
         appendLine("fi")
         appendLine("exit \$RC")
     }
@@ -138,6 +145,27 @@ object CiscoWrapper {
         appendLine("      echo \"\$(date '+%F %T') маршрут \${r} шёл через \${via:-?}, переведён на Cisco (\${tr_dev})\" >> \"\$tr_dir/route-fix.log\"")
         appendLine("    fi")
         appendLine("  done")
+        appendLine("}")
+    }
+
+    /**
+     * Функция drop_dead_routes DIR: убирает постоянные маршруты к отдельным адресам, чей шлюз больше
+     * не в локальной сети. Их оставляет vpnc-script: при подключении он ведёт сервер Cisco через шлюз
+     * текущей сети (дома 192.168.1.254), а при отключении в другой сети удаляет маршрут с новым шлюзом —
+     * и промахивается. Потом подключение к этому серверу (в том числе после перенаправления, например
+     * на vpn5.…) падает с «Can't assign requested address». Маршрут через достижимый шлюз не трогаем —
+     * он рабочий, в том числе у другого VPN. Нужны права root.
+     */
+    fun appendDropDeadRoutes(sb: StringBuilder) = with(sb) {
+        appendLine("drop_dead_routes() {")
+        appendLine("  netstat -rn -f inet | awk '\$3 ~ /G/ && \$3 ~ /H/ && \$3 ~ /S/ && \$3 !~ /I/ && \$2 ~ /^[0-9.]+\$/ && \$4 !~ /^utun/ { print \$1, \$2, \$4 }' |")
+        appendLine("  while read -r dst gw dev; do")
+        appendLine("    got=\$(route -n get \"\$gw\" 2>/dev/null)")
+        appendLine("    if [ \"\$(echo \"\$got\" | awk '/interface:/ { print \$2 }')\" = \"\$dev\" ] && ! echo \"\$got\" | grep -q 'flags:.*GATEWAY'; then continue; fi")
+        appendLine("    route -n delete -host \"\$dst\" \"\$gw\" >/dev/null 2>&1 &&")
+        appendLine("      echo \"\$(date '+%F %T') убран нерабочий маршрут к \${dst} через \${gw} (\${dev}) — шлюз сети, в которой Mac уже нет\" >> \"\$1/route-fix.log\"")
+        appendLine("  done")
+        appendLine("  return 0")
         appendLine("}")
     }
 
@@ -195,6 +223,7 @@ object CiscoWrapper {
         if (splitDomains.isNotEmpty()) {
             appendLine("env(\"CISCO_SPLIT_DNS\") = ${js(splitDomains.joinToString(","))};")
         }
+        appendLine("if (reason == \"disconnect\" && /^127\\./.test(get(\"VPNGATEWAY\"))) del(\"VPNGATEWAY\");")
         appendLine("var realDns = get(\"INTERNAL_IP4_DNS\");")
         appendLine("if (realDns) env(\"INTERNAL_IP4_DNS\") = ${js(tunDns)};")
         appendLine("var rc = sh.Run(\"cscript //nologo \\\"\" + ORIG + \"\\\"\", 0, true);")
