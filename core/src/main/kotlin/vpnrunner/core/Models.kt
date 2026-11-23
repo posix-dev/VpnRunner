@@ -132,6 +132,7 @@ data class AppSettings(
                 ),
                 jira = JiraSettings(
                     enabled = j.bool("enabled", false),
+                    assignmentNotifications = j.bool("assignmentNotifications", true),
                     boardUrl = j.str("boardUrl") ?: "",
                     dayHours = j.str("dayHours")?.toIntOrNull() ?: 8,
                     container = j["container"].obj().let { c ->
@@ -184,6 +185,7 @@ data class AppSettings(
             ),
             "jira" to linkedMapOf(
                 "enabled" to jira.enabled,
+                "assignmentNotifications" to jira.assignmentNotifications,
                 "boardUrl" to jira.boardUrl,
                 "dayHours" to jira.dayHours,
                 "container" to jira.container?.let {

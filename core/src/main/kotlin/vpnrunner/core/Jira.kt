@@ -29,6 +29,8 @@ import kotlin.math.roundToLong
 /** Списание времени в рабочей Jira (через Tempo). */
 data class JiraSettings(
     val enabled: Boolean = false,
+    /** Системные уведомления, когда задачу назначили текущему пользователю. */
+    val assignmentNotifications: Boolean = true,
     /** Ссылка на доску из браузера, например https://jira.company.ru/secure/RapidBoard.jspa?rapidView=2827&projectKey=SYRAX */
     val boardUrl: String = "",
     /** Сколько часов в день нужно списать (вместе с контейнером спринта). */
@@ -226,6 +228,14 @@ class JiraClient(private val host: String, private val token: String, trusted: X
     fun search(jql: String, max: Int = 50): List<JiraIssue> =
         issues(call("GET", "/rest/api/2/search?jql=${enc(jql)}&fields=$fields&maxResults=$max"))
 
+    /** Задачи, которые назначили текущему пользователю после указанного времени. */
+    fun assignedToMeSince(time: java.time.LocalDateTime): List<JiraIssue> {
+        val after = time.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
+        val jql = "assignee = currentUser() AND assignee CHANGED AFTER \"$after\" " +
+            "AND issuetype not in subTaskIssueTypes() ORDER BY updated DESC"
+        return search(jql, 100)
+    }
+
     /** null — такой задачи нет или к ней нет доступа. */
     fun issue(key: String): JiraIssue? = runCatching { call("GET", "/rest/api/2/issue/${enc(key)}?fields=$fields") }
         .fold({ issue(it.obj()) }, { if (it is NotFound) null else throw it })
@@ -348,4 +358,37 @@ class JiraClient(private val host: String, private val token: String, trusted: X
 
     private fun date(s: String): LocalDate = LocalDate.parse(s.take(10))
     private fun enc(s: String) = URLEncoder.encode(s, Charsets.UTF_8)
+}
+
+/** Локальное состояние опроса назначений: не уведомлять о старых задачах и не повторять новые. */
+data class JiraAssignmentWatch(
+    val initialized: Boolean = false,
+    val lastChecked: String = "",
+    val knownKeys: List<String> = emptyList(),
+    val pendingKeys: List<String> = emptyList(),
+) {
+    fun save(file: File) {
+        file.parentFile?.mkdirs()
+        val tmp = File(file.path + ".tmp")
+        tmp.writeText(Json.write(mapOf(
+            "initialized" to initialized,
+            "lastChecked" to lastChecked,
+            "knownKeys" to knownKeys.takeLast(2000),
+            "pendingKeys" to pendingKeys.takeLast(200),
+        )))
+        Fs.restrictToOwner(tmp)
+        tmp.renameTo(file) || run { file.delete(); tmp.renameTo(file) }
+    }
+
+    companion object {
+        fun load(file: File): JiraAssignmentWatch = runCatching {
+            val m = Json.parse(file.readText()).obj()
+            JiraAssignmentWatch(
+                initialized = m.bool("initialized"),
+                lastChecked = m.str("lastChecked") ?: "",
+                knownKeys = m["knownKeys"].arr().mapNotNull { it?.toString() },
+                pendingKeys = m["pendingKeys"].arr().mapNotNull { it?.toString() },
+            )
+        }.getOrDefault(JiraAssignmentWatch())
+    }
 }

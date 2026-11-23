@@ -29,64 +29,68 @@
 ## 2. Карта кода
 
 ```
+core/src/main/kotlin/vpnrunner/core/
+  Models.kt             AppSettings (+ load/save settings.json), CiscoSettings, AbroadSettings, Server, CiscoState
+  SingBoxConfig.kt      генератор конфига sing-box: build() — основной (TUN), buildChain() — цепочка «из-за рубежа»
+  Abroad.kt             режим «из-за рубежа»: выбор российских серверов по названию, Abroad.Plan
+  SubscriptionParser.kt скачивание подписок (+ x-hwid), разбор vless/vmess/trojan/ss/hysteria2 → outbound sing-box
+  XrayJson.kt           подписки в формате Xray JSON
+  Totp.kt               RFC 6238 (код Google Authenticator)
+  GitLab.kt             GitLab API и уведомления о merge request
+  Jira.kt               Jira + Tempo: доски, задачи, списания, доверенный сертификат
+  WorkDay.kt            рабочее время по Москве
+  Json.kt               свой мини-JSON и хелперы obj()/arr()/str()/bool()
+platform/src/main/kotlin/vpnrunner/platform/
+  VpnController.kt      оркестрация Run/Stop/applyRules, проверки, кэш подписок, Clash API
+  Backends.kt           VpnBackend: MacBackend (супервизор от root + pf) и WindowsBackend (дочерние процессы)
+  CiscoWrapper.kt       обёртка над vpnc-script: split-подсети, split-DNS, отбор маршрутов у чужого VPN
+  Platform.kt           пути, поиск бинарников, права администратора Windows, exec()
+  Secrets.kt            пароль, TOTP и токены: Keychain Services macOS / DPAPI Windows
+  KeepAwake.kt          запрет сна на время VPN
 src/main/kotlin/vpnrunner/
-  Main.kt                 точка входа: окно, значок в строке меню (Tray), уведомления, диалог подтверждения
-  core/                   без зависимостей от UI и ОС (кроме java.*)
-    Models.kt             AppSettings (+ load/save settings.json), CiscoSettings, AbroadSettings, Server, CiscoState
-    SingBoxConfig.kt      генератор конфига sing-box: build() — основной (TUN), buildChain() — цепочка «из-за рубежа»
-    Abroad.kt             режим «из-за рубежа»: выбор российских серверов по названию, Abroad.Plan
-    SubscriptionParser.kt скачивание подписок (+ x-hwid), разбор vless/vmess/trojan/ss/hysteria2 → outbound sing-box
-    XrayJson.kt           подписки в формате Xray JSON
-    Totp.kt               RFC 6238 (код Google Authenticator)
-    GitLab.kt             merge request: GitLabList (ссылка → фильтры API), GitLabClient, SeenMergeRequests (gitlab-seen.json)
-    Jira.kt               списание времени: JiraSettings, JiraBoard (ссылка на доску), JiraClient (Jira + Tempo), JiraTrust (свой сертификат), WorkTime
-    WorkDay.kt            рабочее время по Москве: WorkClock, WorkHours, WorkDay, WorkLog (work-days.json)
-    Json.kt               свой мини-JSON (parse/write) + хелперы obj()/arr()/str()/bool()
-  platform/               всё, что зависит от ОС
-    VpnController.kt      оркестрация Run/Stop/applyRules, проверки, кэш подписок, Clash API
-    Backends.kt           VpnBackend: MacBackend (супервизор от root + pf) и WindowsBackend (дочерние процессы)
-    CiscoWrapper.kt       обёртка над vpnc-script: split-подсети, split-DNS (/etc/resolver), отбор маршрутов у чужого VPN
-    Platform.kt           пути (appDir/runDir), поиск бинарников, права админа Windows, exec()
-    Secrets.kt            пароль и TOTP: Связка ключей macOS / DPAPI Windows
-  ui/
-    AppState.kt           всё состояние UI + действия (run/stop/update…), мониторинг, трекер рабочего времени
-    Screens.kt            вкладки (кроме «Браузер»), общие компоненты
-    BrowserTab.kt         встроенный Chromium (KCEF/JCEF)
-    JiraState.kt          вкладка «Jira»: загрузка задач, списание, автосписание контейнера спринта, напоминание
-    JiraTab.kt            вкладка «Jira» (UI)
-    TrayIcon.kt           иконка-щит по Phase
+  Main.kt               точка входа: окно, значок в строке меню (Tray), уведомления, диалог подтверждения
+  ui/                   AppState, Screens, JiraState/JiraTab, BrowserTab, AppIconPainter; IBM Plex Sans/Mono подключены в AppTheme
+assets/icons/            исходный SVG и иконки .icns/.ico для сборок macOS/Windows
+src/main/resources/fonts/ibm-plex/  компактные IBM Plex Sans и IBM Plex Mono, встраиваются в приложение вместе с OFL-лицензией
 ```
 
-Слои: `ui` → `platform` → `core`. `core` ничего не знает о процессах и UI — его удобно проверять отдельно (см. §8).
+Gradle-модули: корневой проект — приложение (Compose Desktop, `Main.kt` и `ui`), `:platform` зависит от `:core`, приложение зависит от обоих. Изменение UI пересобирает приложение, а `core` и `platform` остаются отдельными Gradle-задачами с собственным incremental compilation. Слои зависимостей: `ui` → `platform` → `core`; `core` ничего не знает о процессах и UI — его удобно проверять отдельно (см. §8).
 
 ---
 
 ## 3. Вкладки
 
-Порядок задан в `AppScreen` (`Screens.kt`): `SecondaryScrollableTabRow` (колесо мыши прокручивает его по горизонтали), индекс → функция.
+Порядок задан в `AppScreen` (`Screens.kt`): Главная, GitLab, Jira, Журнал и (если включён) Браузер. Верхняя панель использует компактные переключатели-вкладки и прокручивается колесом мыши по горизонтали. Cisco, подписки и правила находятся во вложенных настройках главной.
 
 ### 3.1 Главная — `HomeTab`
 - Кнопка **Run/Stop** (`AppState.run()` / `requestStop()`; Stop в рабочее время спрашивает подтверждение — `earlyStopWarning`).
 - Карточки-баннеры: права админа (Windows), `KillSwitchStuckCard` (kill switch остался после сбоя), `RestartBanner` (изменены настройки «из-за рубежа» на ходу), `ApplyRulesBanner` (изменены правила).
+- Главная оформлена как тёмная панель: верхний статус VPN, карточка подключения с Run/Stop, три сводных показателя, выбор сервера и быстрый доступ к настройкам.
 - `WorkDayCard` — учёт рабочего дня (только будни, если Cisco включён).
 - Статусы: Cisco / VPN / российские сайты; в режиме «из-за рубежа» — «Режим», «Российский VPN», «Снаружи видно» (`AppState.exitInfo` ← `VpnController.lastExit`), «Остальной трафик», «Kill switch».
-- `ServerPicker` — выбор сервера VPN; переключение на лету через Clash API (`VpnController.switchServer`). В режиме «из-за рубежа» скрыт (сервер выбирается во вкладке «Из-за рубежа»).
+- `ServerPicker` — выбор сервера VPN; переключение на лету через Clash API (`VpnController.switchServer`). В режиме «из-за рубежа» скрыт; российский сервер и параметры цепочки показываются под переключателем режима на главной.
 - Переключатель «Российские сайты мимо VPN» (`AppSettings.russiaDirect`) — только дома.
 
-### 3.2 Правила — `RulesTab`
+### 3.2 Настройки — `HomeVpnSettings`
+Вложенный экран с разделами `CiscoTab`, `SubscriptionsTab` и `RulesTab`; так рабочие настройки не занимают место в верхней навигации.
+
+### 3.3 Cisco — `CiscoTab`
+Настройки Cisco, учёта рабочего времени и путей к бинарникам доступны из блока «Быстрый доступ» на главной.
+
+### 3.4 Правила — `RulesTab`
 Список `SiteRule(domain, DIRECT|PROXY)` → `SingBoxConfig.build`: правило действует и на поддомены (`domain_suffix`), PROXY сильнее правил для российских сайтов. При работающем VPN изменения помечают `rulesDirty`, кнопка «Применить» → `VpnController.applyRules` (пересборка конфига + перечитывание sing-box, Cisco не трогается).
 Из-за рубежа: PROXY = через российский VPN, DIRECT = напрямую (местный интернет).
 
-### 3.3 Подписки — `SubscriptionsTab`
+### 3.5 Подписки — `SubscriptionsTab`
 Ссылка `https://…` или вставленное содержимое (base64 / список ссылок / Xray JSON). Ручные подписки — `Subscription.manual` (`url = "manual:<имя>"`), их серверы живут только в кэше.
 Скачивание — `SubscriptionParser.fetch`: напрямую → системный прокси → локальные прокси 127.0.0.1:2080/10809/7890; передаёт `x-hwid` и др. (`Platform.deviceHeaders`). Заглушки «App not supported» отбрасываются (`isStub`).
 Кэш: `appDir/cache/<hash(url)>.json` (`VpnController.cacheServers/cachedServers`); Run берёт кэш (`preferCache = true`), свежая копия скачивается после запуска.
 
-### 3.4 Cisco — `CiscoTab`
+### 3.6 Cisco — `CiscoTab` (поля конфигурации)
 `CiscoSettings`: сервер, логин, группа, рабочие подсети и домены, `serverCert` (pin-sha256), `otpCombined` (код в одном поле с паролем). Пароль и TOTP-секрет — в `SecretStore` (не в settings.json); `totpPreview` показывает текущий код для сверки.
 Здесь же: «Не давать компьютеру засыпать» (`keepAwake`: `platform/KeepAwake` — на macOS `caffeinate -dims -w <наш PID>`, на Windows PowerShell с `SetThreadExecutionState`; включается из `Main.kt` по `phase` RUNNING/STARTING, процесс умирает вместе с программой), рабочие часы (`workHoursEnabled/workStart/workEnd`) и пути к openconnect / vpnc-script / sing-box (пусто — автопоиск `Platform.find*`).
 
-### 3.5 Из-за рубежа — `AbroadTab`
+### 3.7 Из-за рубежа — переключатель `AbroadHomeControls` на главной
 `AbroadSettings`:
 
 | Поле | Что делает |
@@ -96,15 +100,17 @@ src/main/kotlin/vpnrunner/
 | `allViaRu` | `true` — весь трафик через российский VPN; `false` — через него Cisco и российские сайты, остальное напрямую |
 | `killSwitch` | pf-блокировка на macOS (§5.4) |
 
-Изменение на ходу → `restartNeeded` (действует после Stop → Run). Подробно поток — §4.2.
+Тумблер на главной управляет `AbroadSettings.enabled`; при включении там же появляются выбор российского сервера, режим маршрутизации и kill switch. Изменение режима на ходу → `restartNeeded` (действует после Stop → Run). Подробно поток — §4.2.
 
-### 3.6 GitLab — `GitLabTab`
-Уведомления о новых merge request. Ссылка на список MR из браузера → `GitLabList.parse` (хост, путь проекта, фильтры из адреса) → `apiQuery()` переводит фильтры страницы в параметры `GET /api/v4/projects/:path/merge_requests` (`draft` → `wip`, `label_name[]` → `labels`). Фильтров «одобрен / не одобрен мной» в REST API нет — `GitLabClient` проверяет их сам по `/merge_requests/:iid/approvals` (кэш по `updated_at`). Токен (`read_api`) — `SecretStore.GITLAB_TOKEN`, заголовок `PRIVATE-TOKEN`.
+### 3.7 GitLab — `GitLabTab`
+Уведомления о новых merge request. Адреса списков и токены находятся в сворачиваемом блоке «Адреса и токены GitLab»; на чистой настройке он раскрыт. Ссылка на список MR из браузера → `GitLabList.parse` (хост, путь проекта, фильтры из адреса) → `apiQuery()` переводит фильтры страницы в параметры `GET /api/v4/projects/:path/merge_requests` (`draft` → `wip`, `label_name[]` → `labels`). Фильтров «одобрен / не одобрен мной» в REST API нет — `GitLabClient` проверяет их сам по `/merge_requests/:iid/approvals` (кэш по `updated_at`). Чтение использует `SecretStore.GITLAB_TOKEN` (`read_api`), запись — отдельный `SecretStore.GITLAB_WRITE_TOKEN` (`api`); оба передаются в `PRIVATE-TOKEN` только для соответствующего запроса.
 
-Опрос — `AppState.startGitLabWatcher`: раз в 2 мин, только пока `workVpnUp` (GitLab во внутренней сети; если Cisco выключен в настройках — всегда), после ошибки — через 20 с; «Проверить сейчас» (`checkGitLabNow`) проверяет сразу и без Cisco. Новые = ключи `проект!iid`, которых не было в `gitlab-seen.json`; MR из ссылок, которые ещё ни разу не проверялись, — не новые (не засыпать уведомлениями). В файле — только открытые сейчас: MR, снова попавший под фильтр, — снова новость. Больше 3 новых сразу — одно общее уведомление. Щелчок по MR (`AppScreen`, колбэк `onOpen`) кладёт его адрес в `browserUrl` и переключает на вкладку «Браузер» — она при каждом показе открывается с `browserUrl`; если `BrowserEngine` в `NeedsJbr`/`Failed` — `Desktop.browse`.
+Опрос — `AppState.startGitLabWatcher`: раз в 2 мин, только пока `workVpnUp` (GitLab во внутренней сети; если Cisco выключен в настройках — всегда), после ошибки — через 20 с; «Проверить сейчас» (`checkGitLabNow`) проверяет сразу и без Cisco. Новые = ключи `проект!iid`, которых не было в `gitlab-seen.json`; MR из ссылок, которые ещё ни разу не проверялись, — не новые (не засыпать уведомлениями). В файле — только открытые сейчас: MR, снова попавший под фильтр, — снова новость. Больше 3 новых сразу — одно общее уведомление. Щелчок по MR открывает внутренний экран `GitLabMrPage` во вкладке GitLab и временно увеличивает окно до 1000×820 dp; при возврате восстанавливается прежний размер, если пользователь не менял его сам. `GitLabClient.mergeRequestDetails` получает обзор через `/merge_requests/:iid`, коммиты — `/commits`, пайплайны — `/pipelines`, изменения — `/diffs`, обсуждения с ответами — `/discussions` с резервным чтением `/notes`, постранично до 1000 элементов, SHA версии diff — из `diff_refs` или `/versions`. Вкладка Changes (`GitLabChangesPage`) показывает двухпанельный diff: слева список файлов, справа раскрыты все изменения; общие обсуждения видны сверху, inline-треды и ответы — у соответствующих строк с именами авторов. Длинные строки переносятся. В Overview и Changes доступны исходный текст комментариев и все ответы; с токеном `api` можно ответить, решить тред или открыть его снова через Discussions API. Счётчик показывает число тредов; при пустом результате отображается причина. Новые inline-комментарии отправляются через `POST /discussions`. В Overview загружается статус одобрения; пользователь может одобрить MR и отправить общий комментарий (`POST /approve`, `/notes`). «Открыть в GitLab» даёт выбор внешнего браузера, Chrome выбран по умолчанию.
 
-### 3.7 Jira — `JiraTab.kt`, `JiraState.kt`
+### 3.8 Jira — `JiraTab.kt`, `JiraState.kt`
 Списание времени. Ссылка на доску → `JiraBoard.parse` (`rapidView` или `/boards/N`, `projectKey`, база Jira до `/secure/`). Токен — Personal Access Token (`SecretStore.JIRA_TOKEN`), заголовок `Authorization: Bearer` (Jira Server/DC ≥ 8.14). Редиректы выключены: без токена Jira уводит на SSO — это ошибка токена.
+
+Внутреннее переключение «Задачи / Списание»: список задач всегда доступен отдельно от недельной таблицы Tempo. Над «Другой задачей» чипсы MORGHUL/SYRAX и префиксы проектов из загруженных задач, списаний и доски; щелчок подставляет `PROJECT-` в поле. Новые назначения помечаются `JiraRow.assignmentNew`; раскрытие задачи вызывает `acknowledgeAssignment`. `JiraState.checkAssignments` раз в 2 минуты, независимо от 10-минутного обновления списаний, выполняет `assignee = currentUser() AND assignee CHANGED AFTER …`; при первом успешном опросе создаёт исходный список без уведомлений. Новые ключи получают системные уведомления через `AppState.notice`, а неоткрытые назначения сохраняются в `jira-assigned.json`.
 
 `JiraState.fetch` (раз в 10 мин, пока `workVpnUp`; «Обновить» — сразу): `GET /rest/api/2/myself` (ключ пользователя для Tempo), `/rest/agile/1.0/board/:id/sprint?state=active,future`, задачи спринта `…/sprint/:id/issue?jql=assignee = currentUser() AND issuetype not in subTaskIssueTypes()`, «в работе» — `/rest/api/2/search` с `statusCategory = 4`, ключи из моих MR (`GitLabClient.myMergeRequests`, `scope=created_by_me`; `IssueKeys`, только проекты доски, не больше 15 задач по `GET /issue/:key`). Плюс задачи из `jira.extraIssues` (поле «Другая задача»: `IssueKeys` берёт ключ из ключа или ссылки, `addIssue` проверяет его `GET /issue/:key`; `JiraRow.manual` — для кнопки «Убрать»). Строки — без дублей по ключу, источники — метки. Контейнер исключается из списка и показывается карточкой. Списания — Tempo Timesheets 4: `POST /rest/tempo-timesheets/4/worklogs/search` (с начала автосписания по сегодня), `POST …/worklogs` (`originTaskId` — id задачи, `started` — дата, `remainingEstimate` — новый остаток), `DELETE …/worklogs/:id`; обязательные атрибуты — `GET /rest/tempo-core/1/work-attribute`, последние значения — в `jira.attributes`. Пустой комментарий заменяется названием задачи (Tempo часто требует описание).
 
@@ -114,16 +120,17 @@ src/main/kotlin/vpnrunner/
 
 Контейнер: `containerGaps(from, to)` — будни (`WorkClock.isWorkday`, без праздников) в пределах спринта контейнера, где на него нет ни одного списания в Tempo; Tempo-запрос `fetch` покрывает весь спринт контейнера. `logContainer` списывает по дням, сразу добавляя созданное в `logs`. Кнопки «На неделю» / «На спринт» (`ContainerFill` → `fillContainer`, с подтверждением) — любые дни, в том числе будущие. Автосписание (`autoContainer`, после каждого обновления): спринт контейнера активен; `containerGaps(since, сегодня)`; при `containerOnlyCisco` (по умолчанию) — только дни, где в `work-days.json` есть `firstUp` (Cisco включали) или сегодня `workVpnUp`. Без значений обязательных атрибутов не списывает (пишет почему). После ошибки не повторяет до следующего обновления. Напоминание (`remind`): будни, Cisco сегодня был, с `workEnd − 30 мин` до `workEnd + 3 ч`, списано меньше `dayHours` — раз в день.
 
-### 3.8 Журнал — `LogTab`
+### 3.9 Журнал — `LogTab`
 «Программа» — `AppState.logLines` (последние 500 строк); «Cisco» — `run/openconnect.log`; «sing-box» — `run/sing-box.log`; «Российский VPN» (в режиме «из-за рубежа») — `run/chain.log`. Файлы читаются раз в 2 с (`AppState.readLog(LogKind)`).
 
-### 3.9 Браузер — `BrowserTab.kt`
-**Сейчас скрыта:** `BrowserEngine.TAB_ENABLED = false` — вкладки нет в `AppScreen`, `onOpen` (GitLab, Jira) открывает ссылки через `Desktop.browse`, `Main.relaunchOnJcefJava` ничего не делает. Вернуть — `true`.
+### 3.10 Браузер — `BrowserTab.kt`
+**Сейчас скрыта:** `BrowserEngine.TAB_ENABLED = false` — вкладки нет в `AppScreen`; ссылки из Jira открываются через `Desktop.browse`, а MR GitLab отображается во внутреннем экране `GitLabMrPage`. `Main.relaunchOnJcefJava` ничего не делает. Вернуть — `true`.
 
 Встроенный Chromium через compose-webview + KCEF, но **движок — JCEF из JetBrains Runtime** (`BrowserEngine.jbrCef`): программу нужно запускать на JBR 17 с JCEF (`build.gradle.kts` ищет `~/Library/Java/JavaVirtualMachines/jbrsdk_jcef-17*` или `-Pjbr.jcef.home`). На обычной Java вкладка показывает инструкцию — KCEF на macOS роняет весь процесс, если качает свой Chromium. Кэш/куки — `appDir/browser/`, последний адрес — `AppSettings.browserUrl`. Из IDE лучше запускать через `.run/VpnRunner.run.xml` (Gradle `run`). Стрелка у `main` идёт на Java IDE без JCEF и без `--add-opens` из `build.gradle.kts`, поэтому `Main.relaunchOnJcefJava` (только macOS, не в собранном приложении) перезапускает программу на `jbrsdk_jcef-17*` с тем же classpath и теми же `--add-opens`, ждёт её и завершает при «Stop» (повторный перезапуск не делается — переменная окружения `VPNRUNNER_RELAUNCHED`). Флаги `--add-opens` продублированы в `build.gradle.kts` и `Main.kt` — менять в обоих местах. Ошибки загрузки главного фрейма (`WebViewState.errorsForCurrentRequest`, кроме `-3` ERR_ABORTED) показываются плашкой над страницей: Chromium при ошибке, например при недоверенном сертификате (коды `-200…-299`), оставляет пустую страницу.
 
 ### Вне вкладок
-- **Значок в строке меню** (`Main.kt`, `TrayIcon.forPhase`): серый/жёлтый/зелёный; меню Включить/Выключить/Открыть окно/Выход. Закрытие окна только прячет его.
+- **Версия приложения** — единственный источник `appVersion` в `gradle.properties`. Корневой проект, `core`, `platform` и `nativeDistributions.packageVersion` получают одно значение. Задача `jar` пишет его в `Implementation-Version`, а Gradle-запуск передаёт в `vpnrunner.version`; `BuildInfo` читает эти значения, а `AppScreen` показывает версию в верхней панели. Только при прямом запуске классов из IDE без Gradle и JAR отображается `dev`.
+- **Значок приложения** (`assets/icons`, `AppIconPainter`): фирменный V-маршрут в окне, Dock/ярлыке и установочных пакетах. При запуске из Gradle/IDE `Main.installDockIcon` задаёт PNG через `java.awt.Taskbar`, иначе macOS показывает Java. Значок строки меню — цветной круг с V: серый/жёлтый/зелёный по состоянию. Меню Включить/Выключить/Открыть окно/Выход. Закрытие окна только прячет его.
 - **Уведомления** — `AppState.notifications` (`Notice`): `warning = true` — рабочее время, `false` — новые MR (`Notification.Type.Info`).
 - **Трекер рабочего времени** (`AppState.startWorkTracker`): раз в 20 с проверяет, поднят ли Cisco (`ciscoAlive && cisco.state`), ведёт `WorkDay`, шлёт уведомления (за 10 мин до начала, каждые 15 мин без Cisco, обрыв, конец дня). Время — всегда по Москве (`WorkClock.ZONE`).
 
@@ -143,7 +150,9 @@ AppState.run → VpnController.loadServers(preferCache) → VpnController.run:
   waitForCisco()                          ждёт run/cisco.state от обёртки (TUNDEV, DNS, DOMAINS, ROUTES)
   checkCiscoRoutes()                      рабочий адрес идёт через utun Cisco? (иначе — другой VPN перехватил)
   downloadRuleSets()                      geosite-ru / geoip-ru → appDir/rules (раз в 3 дня)
+  probeBeforeConnect()                    проверяет серверы по HTTPS до включения TUN
   SingBoxConfig.build(...) → config.json → backend.startSingBox() → waitForSingBox() (Clash API :9090)
+  switchServer()                          применяет проверенный выбор поверх кэша Clash API
   checkWorkDns()                          рабочее имя резолвится во внутренний адрес?
 ```
 Stop: `backend.stop()` → супервизор: sing-box → openconnect → (цепочка) → kill switch → `repair_dns`.
@@ -178,6 +187,8 @@ VpnController.run, ветка abroad:
 
 ### 5.1 Конфиг основного sing-box — `SingBoxConfig.build`
 - **outbounds** (`serverOutbounds`): все серверы + `auto` (urltest) + `proxy` (selector, `default` = выбранный) + `direct`.
+- Дома `probeBeforeConnect` запускает временный sing-box в отдельной папке без TUN на свободном локальном порту. В режиме «Авто» сначала проверяется последний рабочий сервер из `cache/last-working-server`. Полный поиск запускается, если сохранённого сервера нет в списке или он недоступен. При ручном выборе остальные серверы проверяются, если оба HTTPS-запроса через выбранный сервер не проходят. `findWorkingServer` проверяет серверы группами до шести и выбирает ответивший с наименьшей задержкой по всему списку кандидатов. Временный процесс завершается до запуска основного sing-box.
+- `AppState.startMonitor` проверяет активный сервер примерно каждые 20 секунд через Clash API. При недоступности применяет рабочую замену только к текущему подключению. Ручной выбор в настройках сохраняется.
 - **TUN** `172.19.0.1/30`, `auto_route`, `strict_route: false` (true ломает маршруты Cisco на Windows), `route_exclude_address` = рабочие подсети + DNS Cisco (+ адреса российских серверов из-за рубежа). На macOS имя utun выбирает sing-box.
 - **route.rules** по порядку: sniff → hijack-dns → private → российские серверы (abroad) → рабочие подсети/домены → хосты подписок (через `proxy`) → PROXY-правила → DIRECT-правила → российские сайты (дома `direct`, из-за рубежа `proxy`). `final`: `proxy`, из-за рубежа при `!allViaRu` — `direct`.
 - **DNS**: `dns-remote` (DoH 1.1.1.1 через `proxy`, final); `dns-direct` (дома UDP 77.88.8.8, из-за рубежа DoH 1.1.1.1 напрямую); `dns-work` (DNS Cisco, `bind_interface` = utun Cisco) — **только** для рабочих доменов (свои + присланные сервером); `dns-pin` (`type: hosts`) — адреса российских серверов, чтобы не спрашивать DNS, который ходит через них же. `strategy: ipv4_only`.
@@ -239,7 +250,7 @@ block всё остальное                      (в т.ч. IPv6: TUN тол
 |---|---|---|
 | Настройки `settings.json`, `work-days.json`, `gitlab-seen.json`, `jira-ca.pem`, `device-id`, `cache/`, `rules/`, `browser/` | `~/Library/Application Support/VpnRunner/` | `%APPDATA%\VpnRunner\` |
 | run/ (скрипты, конфиги, журналы, служебные файлы §5.4) | `…/VpnRunner/run/` | `C:\ProgramData\VpnRunner\run\` |
-| Пароль, TOTP, токены GitLab и Jira | Связка ключей, сервис `VpnRunner` | `%APPDATA%\VpnRunner\secrets` (DPAPI) |
+| Пароль, TOTP, токены GitLab и Jira | Связка ключей через Keychain Services API, сервис `VpnRunner` | `%APPDATA%\VpnRunner\secrets` (DPAPI) |
 
 Часть файлов в run/ создаёт root — программа их не перезаписывает, а удаляет (`prepare()`) и создаёт заново.
 

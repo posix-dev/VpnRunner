@@ -2,11 +2,16 @@ package vpnrunner.platform
 
 import vpnrunner.core.*
 import java.io.File
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.file.Files
 import java.time.Duration
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 
 /**
  * Порядок Run: подписки → Cisco (openconnect) → ждём подключения → sing-box с правилами.
@@ -32,6 +37,12 @@ class VpnController(
     private val http = HttpClient.newBuilder()
         .proxy(java.net.ProxySelector.of(null))
         .connectTimeout(Duration.ofSeconds(3)).build()
+
+    private val serverLock = Any()
+    private var monitorServer = false
+    private var serverRevision = 0L
+    private var lastUnreachable: String? = null
+    private val lastWorkingServerFile get() = File(Platform.appDir, "cache/last-working-server")
 
     /** preferCache = true: если есть сохранённая копия — сразу взять её (для быстрого Run; свежая подписка скачается после запуска VPN). */
     fun loadServers(settings: AppSettings, preferCache: Boolean = false): List<Server> {
@@ -93,7 +104,7 @@ class VpnController(
             val found = Abroad.ruServers(settings, servers)
             check(found.isNotEmpty()) {
                 "Не нашёл российских серверов: ни в одном названии нет 🇷🇺, RU или «Россия». " +
-                    "Выберите сервер вручную во вкладке «Из-за рубежа»"
+                    "Выберите российский сервер на главной в режиме «Я сейчас за рубежом»"
             }
             log("Из-за рубежа: российский VPN — " + if (found.size == 1) "«${found[0].name}»" else "самый быстрый из ${found.size} российских серверов")
             val pinned = resolveServers(found)
@@ -141,16 +152,29 @@ class VpnController(
         val needRuleSets = if (plan != null) !plan.allViaRu else settings.russiaDirect
         // Из-за рубежа (под kill switch) напрямую не скачать — качаем через российский VPN
         ruleSetFiles = if (needRuleSets) downloadRuleSets(viaChain = plan != null) else emptyMap()
-        val cfg = SingBoxConfig.build(settings, vpnServers, state, backend.runDir.path, ruleSetFiles, plan)
+        val selected = if (plan == null) servers.firstOrNull { it.id == settings.selectedServer } else null
+        if (plan == null && selected == null && settings.selectedServer != AppSettings.AUTO) {
+            log("Выбранного VPN-сервера больше нет в подписках — включаю автовыбор")
+        }
+        val preferred = if (plan == null) selected ?: lastWorkingServer(servers) else null
+        val checked = if (plan == null) probeBeforeConnect(singbox, servers, preferred) else null
+        val effectiveSettings = (checked ?: preferred)?.let { settings.copy(selectedServer = it.id) } ?: settings
+        val cfg = SingBoxConfig.build(effectiveSettings, vpnServers, state, backend.runDir.path, ruleSetFiles, plan)
         backend.singboxConfig.writeText(Json.write(cfg))
         log("Запускаю VPN (sing-box)…")
         backend.startSingBox()
         waitForSingBox()
         lastAbroad = plan
         lastRuServers = vpnServers
+        if (plan == null) {
+            val tag = (checked ?: preferred)?.let(SingBoxConfig::tagFor) ?: SingBoxConfig.AUTO_TAG
+            // Clash API может восстановить прошлый сервер из кэша поверх настроек приложения.
+            if (!switchServer(tag)) log("Не удалось применить выбранный VPN-сервер")
+            else if (checked != null) rememberWorkingServer(tag)
+        }
         if (state != null) checkWorkDns(state)
         log(when {
-            plan == null -> "Готово: VPN работает. Российские сайты ${if (settings.russiaDirect) "идут напрямую" else "идут через VPN"}."
+            plan == null -> "VPN запущен. Российские сайты ${if (settings.russiaDirect) "идут напрямую" else "идут через VPN"}."
             plan.allViaRu -> "Готово: весь трафик идёт через российский VPN" + (lastExit?.let { " ($it)" } ?: "") + "."
             else -> "Готово: Cisco и российские сайты идут через российский VPN" + (lastExit?.let { " ($it)" } ?: "") + ", остальное — напрямую."
         })
@@ -241,12 +265,12 @@ class VpnController(
             Thread.sleep(1500)
         }
         val e = exit ?: throw IllegalStateException(
-            "Российский VPN не работает: через него не открывается ни один сайт. Выберите другой сервер во вкладке «Из-за рубежа». " +
+            "Российский VPN не работает: через него не открывается ни один сайт. Выберите другой российский сервер на главной. " +
                 "Подробности — в журнале sing-box (цепочка: ${backend.chainLog.path})"
         )
         val where = listOf(e.ip, e.city, e.country).filter { it.isNotBlank() }.joinToString(", ")
         check(e.country.equals("RU", true)) {
-            "Выход российского VPN — не в России ($where). Cisco не подключаю: он увидел бы эту страну. Выберите другой сервер во вкладке «Из-за рубежа»"
+            "Выход российского VPN — не в России ($where). Cisco не подключаю: он увидел бы эту страну. Выберите другой российский сервер на главной"
         }
         lastExit = where
         log("Российский VPN работает: снаружи видно $where")
@@ -494,12 +518,19 @@ class VpnController(
         val needRuleSets = if (plan != null) !plan.allViaRu else settings.russiaDirect
         if (needRuleSets && ruleSetFiles.isEmpty()) ruleSetFiles = downloadRuleSets(viaChain = plan != null)
         val cfg = SingBoxConfig.build(settings, if (plan != null) lastRuServers else servers, lastCiscoState, backend.runDir.path, ruleSetFiles, plan)
-        backend.singboxConfig.writeText(Json.write(cfg))
-        backend.reloadSingBox()
+        synchronized(serverLock) {
+            serverRevision++
+            backend.singboxConfig.writeText(Json.write(cfg))
+            backend.reloadSingBox()
+        }
         log("Правила применены")
     }
 
     fun stop() {
+        synchronized(serverLock) {
+            monitorServer = false
+            serverRevision++
+        }
         log("Останавливаю…")
         backend.stop()
         lastCiscoState = null
@@ -512,8 +543,83 @@ class VpnController(
 
     // ---- управление запущенным sing-box через Clash API ----
 
+    private fun lastWorkingServer(servers: List<Server>): Server? {
+        val tag = runCatching { lastWorkingServerFile.readText() }.getOrNull() ?: return null
+        return servers.firstOrNull { SingBoxConfig.tagFor(it) == tag }
+    }
+
+    private fun rememberWorkingServer(tag: String) {
+        runCatching {
+            val file = lastWorkingServerFile
+            if (!file.isFile || file.readText() != tag) {
+                file.parentFile.mkdirs()
+                file.writeText(tag)
+                Fs.restrictToOwner(file)
+            }
+        }
+    }
+
+    private fun probeBeforeConnect(singbox: String, servers: List<Server>, preferred: Server?): Server? {
+        return try {
+            withServerProbe(singbox, servers) { api, process ->
+                val current = preferred?.let(SingBoxConfig::tagFor)
+                if (current != null && serverResponds(current, api)) return@withServerProbe preferred
+                val byTag = servers.associateBy(SingBoxConfig::tagFor)
+                val replacement = findWorkingServer(byTag.keys.filter { it != current }, api) { process.isAlive }
+                log(when {
+                    current == null && replacement == null -> "По результатам проверки ни один VPN-сервер не ответил"
+                    current == null -> "Самый быстрый VPN-сервер по результатам проверки — «$replacement»"
+                    replacement == null -> "VPN-сервер «$current» не отвечает, рабочая замена не найдена"
+                    else -> "VPN-сервер «$current» не отвечает — подключаю «$replacement»"
+                })
+                replacement?.let(byTag::get)
+            }
+        } catch (e: InterruptedException) {
+            throw e
+        } catch (_: Exception) {
+            log("Не удалось выполнить проверку VPN-сервера перед подключением — повторю после запуска")
+            null
+        }
+    }
+
+    private fun withServerProbe(singbox: String, servers: List<Server>, checkServers: (String, Process) -> Server?): Server? {
+        val scratch = Files.createTempDirectory("vpnrunner-probe-").toFile()
+        try {
+            val port = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+            val api = "127.0.0.1:$port"
+            val process = ProcessBuilder(File(singbox).absolutePath, "run", "-c", "stdin")
+                .directory(scratch).redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD).start()
+            try {
+                process.outputStream.bufferedWriter(Charsets.UTF_8).use {
+                    it.write(Json.write(SingBoxConfig.buildServerProbe(servers, api)))
+                }
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+                while (process.isAlive && clashGet("/version", api) == null && System.nanoTime() < deadline) {
+                    Thread.sleep(100)
+                }
+                check(process.isAlive && clashGet("/version", api) != null)
+                return checkServers(api, process)
+            } finally {
+                process.destroyForcibly()
+                process.waitFor()
+            }
+        } finally {
+            scratch.deleteRecursively()
+        }
+    }
+
     /** Переключить сервер на лету. tag = SingBoxConfig.tagFor(server) или "auto". */
-    fun switchServer(tag: String): Boolean {
+    fun switchServer(tag: String): Boolean = synchronized(serverLock) {
+        if (lastAbroad != null || !backend.singboxAlive()) return@synchronized false
+        serverRevision++
+        lastUnreachable = null
+        val switched = selectProxy(tag)
+        if (switched) monitorServer = true
+        switched
+    }
+
+    private fun selectProxy(tag: String): Boolean {
         val body = Json.write(mapOf("name" to tag), pretty = false)
         return runCatching {
             val req = HttpRequest.newBuilder(URI("http://${SingBoxConfig.CLASH_API}/proxies/${enc(SingBoxConfig.PROXY_TAG)}"))
@@ -523,9 +629,89 @@ class VpnController(
         }.getOrDefault(false)
     }
 
+    /** Оставляем рабочий сервер, даже если у другого задержка меньше. */
+    fun checkServerAvailability() {
+        val revision = synchronized(serverLock) {
+            if (!monitorServer) return
+            serverRevision
+        }
+        val proxy = proxyInfo()
+        val current = proxy.str("now") ?: return
+        val candidates = proxy["all"].arr().filterIsInstance<String>()
+        if (current !in candidates) return
+        val auto = current == SingBoxConfig.AUTO_TAG
+        if (!auto && serverResponds(current, SingBoxConfig.CLASH_API)) {
+            synchronized(serverLock) {
+                if (serverRevision == revision) {
+                    lastUnreachable = null
+                    rememberWorkingServer(current)
+                }
+            }
+            return
+        }
+
+        val alternatives = candidates.filter { it != current && it != SingBoxConfig.AUTO_TAG }
+        val replacement = findWorkingServer(alternatives, SingBoxConfig.CLASH_API) {
+            synchronized(serverLock) { serverRevision == revision }
+        }
+
+        synchronized(serverLock) {
+            if (serverRevision != revision || proxyInfo().str("now") != current) return
+            if (replacement != null && selectProxy(replacement)) {
+                lastUnreachable = null
+                rememberWorkingServer(replacement)
+                log(if (auto) "Самый быстрый VPN-сервер по результатам проверки — «$replacement»"
+                    else "VPN-сервер «$current» не отвечает — переключаю на «$replacement»")
+            } else if (lastUnreachable != current) {
+                lastUnreachable = current
+                log(when {
+                    replacement != null -> "Не удалось переключить VPN на «$replacement»"
+                    auto -> "По результатам проверки ни один VPN-сервер не ответил"
+                    else -> "VPN-сервер «$current» не отвечает, рабочая замена не найдена"
+                })
+            }
+        }
+    }
+
+    private fun serverResponds(tag: String, api: String) =
+        SingBoxConfig.SERVER_PROBE_URLS.any { serverDelay(tag, it, api).join() != null }
+
+    private fun findWorkingServer(candidates: List<String>, api: String, keepChecking: () -> Boolean): String? {
+        val (primary, secondary) = SingBoxConfig.SERVER_PROBE_URLS
+        var best: Pair<String, Int>? = null
+        for (batch in candidates.chunked(6)) {
+            if (!keepChecking()) return null
+            val probes = batch.associateWith { tag ->
+                serverDelay(tag, primary, api).thenCompose { delay ->
+                    if (delay != null) CompletableFuture.completedFuture(delay) else serverDelay(tag, secondary, api)
+                }
+            }
+            val batchBest = probes.mapNotNull { (tag, probe) -> probe.join()?.let { tag to it } }
+                .minByOrNull { it.second }
+            if (batchBest != null && (best == null || batchBest.second < best.second)) best = batchBest
+        }
+        return best?.first
+    }
+
+    private fun serverDelay(tag: String, url: String, api: String): CompletableFuture<Int?> {
+        val path = "/proxies/${enc(tag)}/delay?timeout=3000&url=${enc(url)}"
+        val request = HttpRequest.newBuilder(URI("http://$api$path"))
+            .timeout(Duration.ofSeconds(4)).GET().build()
+        return http.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+            .handle { response, _ ->
+                if (response?.statusCode() == 200) {
+                    runCatching { Json.parse(response.body()).obj().str("delay")?.toIntOrNull() }
+                        .getOrNull()?.takeIf { it > 0 }
+                } else null
+            }
+    }
+
+    private fun proxyInfo() =
+        clashGet("/proxies/${enc(SingBoxConfig.PROXY_TAG)}")?.let { Json.parse(it).obj() }.orEmpty()
+
     /** Через какой сервер сейчас идёт трафик (для режима «авто» — какой выбран автоматически). */
     fun currentServer(): String? {
-        val proxy = clashGet("/proxies/${enc(SingBoxConfig.PROXY_TAG)}")?.let { Json.parse(it).obj().str("now") } ?: return null
+        val proxy = proxyInfo().str("now") ?: return null
         if (proxy != SingBoxConfig.AUTO_TAG) return proxy
         val auto = clashGet("/proxies/${enc(SingBoxConfig.AUTO_TAG)}")?.let { Json.parse(it).obj().str("now") }
         return "авто → ${auto ?: "…"}"

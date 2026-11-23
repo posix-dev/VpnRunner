@@ -7,30 +7,33 @@
 macOS: `~/Library/Application Support/VpnRunner/settings.json`, Windows: `%APPDATA%\VpnRunner\settings.json`.
 Читается в `AppSettings.load`, пишется в `AppSettings.save` (через `.tmp` + rename, права 600) при каждом изменении в интерфейсе (`AppState.update`). Отсутствующее поле — значение по умолчанию.
 
+Версия приложения не является пользовательской настройкой и в `settings.json` не хранится. Она задаётся как `appVersion` в корневом `gradle.properties`, попадает в манифест приложения и установщик.
+
 | Поле | Тип / умолчание | Вкладка | Что делает |
 |---|---|---|---|
-| `subscriptions[]` | `{name, url}` | Подписки | Подписки. `url` = `https://…` или `manual:<имя>` (вставлено вручную, серверы только в кэше) |
-| `selectedServer` | `"auto"` | Главная | id сервера (`<подписка>/<имя>`) или `auto` — самый быстрый (urltest) |
+| `subscriptions[]` | `{name, url}` | Главная → Все настройки VPN → Подписки | `url` = `https://…` или `manual:<имя>` (вставлено вручную, серверы только в кэше) |
+| `selectedServer` | `"auto"` | Главная | id предпочтительного сервера (`<подписка>/<имя>`) или `auto` — при Run сначала проверяется последний рабочий сервер. При ручном выборе каждый Run начинается с проверки выбранного сервера |
 | `russiaDirect` | `true` | Главная | Российские сайты (.ru/.su/.рф…, geosite-ru, geoip-ru) — напрямую. Только дома |
-| `rules[]` | `{domain, mode: DIRECT\|PROXY}` | Правила | Свои сайты; действуют и на поддомены |
-| `cisco.enabled` | `true` | Cisco | Подключать Cisco при Run |
-| `cisco.server` | `""` | Cisco | Адрес как в AnyConnect |
-| `cisco.user`, `cisco.authGroup` | `""` | Cisco | Логин и группа (`--authgroup`) |
-| `cisco.workSubnets[]` | `[]` | Cisco | Что пускать через Cisco. Пусто — что прислал сервер |
-| `cisco.workDomains[]` | `[]` | Cisco | Рабочие домены: их (и только их) DNS-запросы — в DNS Cisco. Дополняют присланные сервером |
-| `cisco.serverCert` | `""` | Cisco | `pin-sha256:…` для самоподписанного сертификата (`--servercert`) |
-| `cisco.otpCombined` | `false` | Cisco | Код TOTP дописывается к паролю в том же поле |
-| `openconnectPath`, `vpncScriptPath`, `singboxPath` | `""` | Cisco → Дополнительно | Пути; пусто — автопоиск (`Platform.find*`: Homebrew, PATH, `appDir/bin`) |
+| `rules[]` | `{domain, mode: DIRECT\|PROXY}` | Главная → Все настройки VPN → Правила | Свои сайты; действуют и на поддомены |
+| `cisco.enabled` | `true` | Главная → Быстрый доступ → Cisco | Подключать Cisco при Run |
+| `cisco.server` | `""` | Главная → Быстрый доступ → Cisco | Адрес как в AnyConnect |
+| `cisco.user`, `cisco.authGroup` | `""` | Главная → Быстрый доступ → Cisco | Логин и группа (`--authgroup`) |
+| `cisco.workSubnets[]` | `[]` | Главная → Быстрый доступ → Cisco | Что пускать через Cisco. Пусто — что прислал сервер |
+| `cisco.workDomains[]` | `[]` | Главная → Быстрый доступ → Cisco | Рабочие домены: их (и только их) DNS-запросы — в DNS Cisco. Дополняют присланные сервером |
+| `cisco.serverCert` | `""` | Главная → Быстрый доступ → Cisco | `pin-sha256:…` для самоподписанного сертификата (`--servercert`) |
+| `cisco.otpCombined` | `false` | Главная → Быстрый доступ → Cisco | Код TOTP дописывается к паролю в том же поле |
+| `openconnectPath`, `vpncScriptPath`, `singboxPath` | `""` | Настройки Cisco → Дополнительно | Пути; пусто — автопоиск (`Platform.find*`: Homebrew, PATH, `appDir/bin`) |
 | `browserUrl` | `""` | Браузер | Последний открытый адрес |
-| `workHoursEnabled` | `true` | Cisco | Следить за рабочим временем |
-| `workStart`, `workEnd` | `"09:00"`, `"18:00"` | Cisco | Рабочие часы, **по Москве**, будни |
-| `keepAwake` | `true` | Cisco | Пока VPN включён (Run), компьютер и экран не засыпают |
-| `abroad.enabled` | `false` | Из-за рубежа | Режим «я за рубежом» |
-| `abroad.ruServer` | `"auto"` | Из-за рубежа | id российского сервера или `auto` (по названию: 🇷🇺, RU, MSK, Россия, Москва, СПб…) |
-| `abroad.allViaRu` | `true` | Из-за рубежа | Весь трафик через российский VPN; `false` — только Cisco и российские сайты |
+| `workHoursEnabled` | `true` | Настройки Cisco | Следить за рабочим временем |
+| `workStart`, `workEnd` | `"09:00"`, `"18:00"` | Настройки Cisco | Рабочие часы, **по Москве**, будни |
+| `keepAwake` | `true` | Настройки Cisco | Пока VPN включён (Run), компьютер и экран не засыпают |
+| `abroad.enabled` | `false` | Главная | Режим «я за рубежом» (тумблер) |
+| `abroad.ruServer` | `"auto"` | Главная | id российского сервера или `auto` (по названию: 🇷🇺, RU, MSK, Россия, Москва, СПб…) |
+| `abroad.allViaRu` | `true` | Главная | Весь трафик через российский VPN; `false` — только Cisco и российские сайты |
 | `gitlab.enabled` | `false` | GitLab | Уведомлять о новых merge request |
-| `gitlab.urls[]` | `[]` | GitLab | Ссылки на списки MR из браузера вместе с фильтрами (`…/-/merge_requests?draft=no&…`) |
+| `gitlab.urls[]` | `[]` | GitLab | Ссылки на списки MR из браузера вместе с фильтрами (`…/-/merge_requests?draft=no&…`); карточка открывает внутренний экран MR с обзором, коммитами, пайплайнами и diff |
 | `jira.enabled` | `false` | Jira | Списание времени в Jira включено |
+| `jira.assignmentNotifications` | `true` | Jira | Системные уведомления о новых назначениях (опрос раз в 2 мин при доступном Cisco) |
 | `jira.boardUrl` | `""` | Jira | Ссылка на доску из браузера (`…/secure/RapidBoard.jspa?rapidView=…`) |
 | `jira.dayHours` | `8` | Jira | Норма списания за день, часов (вместе с контейнером) |
 | `jira.containerHours` | `2` | Jira | Сколько часов в рабочий день само списывается на контейнер спринта |
@@ -38,9 +41,9 @@ macOS: `~/Library/Application Support/VpnRunner/settings.json`, Windows: `%APPDA
 | `jira.container` | `null` | Jira | Контейнер спринта: `sprintId`, `sprintName`, `issueKey`, `issueId`, `since` (yyyy-MM-dd — с какого дня списывать) |
 | `jira.attributes` | `{}` | Jira | Последние значения обязательных атрибутов Tempo (ключ атрибута → значение) — для формы и автосписания |
 | `jira.extraIssues[]` | `[]` | Jira | Задачи, добавленные вручную полем «Другая задача» (ключи, не больше 20) — показываются в «Вне спринта», пока их не уберут |
-| `abroad.killSwitch` | `true` | Из-за рубежа | Блокировка интернета без российского VPN (macOS) |
+| `abroad.killSwitch` | `true` | Главная | Блокировка интернета без российского VPN (macOS) |
 
-**Не в settings.json** — секреты (`SecretStore`): `cisco-password`, `cisco-totp-secret`, `gitlab-token`, `jira-token`. macOS — Связка ключей (сервис `VpnRunner`, утилита `security`), Windows — `%APPDATA%\VpnRunner\secrets\` (DPAPI, PowerShell).
+**Не в settings.json** — секреты (`SecretStore`): `cisco-password`, `cisco-totp-secret`, `gitlab-token`, `gitlab-write-token`, `jira-token`. macOS — Связка ключей (сервис `VpnRunner`, системный Keychain Services API), Windows — `%APPDATA%\VpnRunner\secrets\` (DPAPI; файл содержит зашифрованное значение). Токены чтения и записи GitLab вводятся отдельно.
 
 ## Папка настроек (appDir)
 
@@ -49,9 +52,11 @@ macOS: `~/Library/Application Support/VpnRunner/settings.json`, Windows: `%APPDA
 | `settings.json` | настройки (выше) |
 | `work-days.json` | учёт рабочих дней, 60 дней (`WorkLog`) |
 | `gitlab-seen.json` | уже показанные merge request (`проект!iid`) и проверенные ссылки — чтобы не уведомлять повторно |
+| `jira-assigned.json` | курсор опроса назначений, уже известные задачи и непросмотренные новые назначения |
 | `jira-ca.pem` | сертификат, которому пользователь доверился для Jira (корневой сертификат компании); удалить — программа спросит снова |
 | `device-id` | случайный HWID для заголовка `x-hwid` подписок (создаётся один раз) |
 | `cache/<hash>.json` | последняя удачная копия серверов каждой подписки |
+| `cache/last-working-server` | метка последнего рабочего сервера второго VPN для быстрого запуска в режиме «Авто» |
 | `cache/ru-hosts.json` | из-за рубежа: имя российского сервера → IPv4 (на случай, если DoH недоступен) |
 | `rules/geosite-ru.srs`, `rules/geoip-ru.srs` | списки российских сайтов и IP, обновляются раз в 3 дня |
 | `browser/` | кэш и куки встроенного браузера |

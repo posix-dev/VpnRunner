@@ -16,7 +16,7 @@ import java.time.format.DateTimeFormatter
 
 enum class Phase { STOPPED, STARTING, RUNNING, STOPPING }
 
-/** Уведомление от значка в строке меню. warning — напоминание о рабочем времени; иначе — просто новость (новый MR). */
+/** Уведомление от значка в строке меню. warning — напоминание о рабочем времени; иначе — новость GitLab или Jira. */
 data class Notice(val title: String, val text: String, val warning: Boolean = true)
 
 class AppState(private val scope: CoroutineScope) {
@@ -37,9 +37,9 @@ class AppState(private val scope: CoroutineScope) {
 
     val isAdmin = Platform.isWindowsAdmin()
     val secrets = Platform.secrets
-    var hasPassword by mutableStateOf(secrets.get(SecretStore.CISCO_PASSWORD) != null)
+    var hasPassword by mutableStateOf(secrets.contains(SecretStore.CISCO_PASSWORD))
         private set
-    var hasTotp by mutableStateOf(secrets.get(SecretStore.CISCO_TOTP) != null)
+    var hasTotp by mutableStateOf(secrets.contains(SecretStore.CISCO_TOTP))
         private set
     /** Правила поменялись, пока VPN работает. */
     var rulesDirty by mutableStateOf(false)
@@ -57,6 +57,7 @@ class AppState(private val scope: CoroutineScope) {
     private val backend: VpnBackend? = runCatching { Platform.backend() }.getOrNull()
     private val controller = backend?.let { b -> VpnController(b, secrets) { msg -> log(msg) } }
     private var monitorJob: Job? = null
+    private var serverCheckJob: Job? = null
 
     private val timeFmt = DateTimeFormatter.ofPattern("HH:mm:ss")
 
@@ -120,7 +121,9 @@ class AppState(private val scope: CoroutineScope) {
 
     // ---- merge request в рабочем GitLab ----
 
-    var hasGitLabToken by mutableStateOf(secrets.get(SecretStore.GITLAB_TOKEN) != null)
+    var hasGitLabToken by mutableStateOf(secrets.contains(SecretStore.GITLAB_TOKEN))
+        private set
+    var hasGitLabWriteToken by mutableStateOf(secrets.contains(SecretStore.GITLAB_WRITE_TOKEN))
         private set
     /** Открытые MR по ссылкам из настроек (с их фильтрами) — по последней удачной проверке. */
     var mergeRequests by mutableStateOf<List<MergeRequest>>(emptyList())
@@ -129,8 +132,21 @@ class AppState(private val scope: CoroutineScope) {
         private set
     var gitlabChecking by mutableStateOf(false)
         private set
+    var selectedGitLabMr by mutableStateOf<MergeRequest?>(null)
+        private set
+    var gitlabMrDetails by mutableStateOf<GitLabMergeRequestDetails?>(null)
+        private set
+    var gitlabMrLoading by mutableStateOf(false)
+        private set
+    var gitlabMrError by mutableStateOf<String?>(null)
+        private set
+    var gitlabMrActionBusy by mutableStateOf(false)
+        private set
+    var gitlabMrActionMessage by mutableStateOf<String?>(null)
+        private set
     // Токен читаем из Связки ключей один раз: иначе каждые 2 минуты запускалась бы утилита security.
     private var gitlabClient: GitLabClient? = null
+    private var gitlabMrJob: Job? = null
     private val gitlabWake = Channel<Unit>(Channel.CONFLATED)
     private val gitlabSeenFile = File(Platform.appDir, "gitlab-seen.json")
 
@@ -155,10 +171,153 @@ class AppState(private val scope: CoroutineScope) {
     /** Проверить сейчас, не дожидаясь очередных 2 минут (и даже если Cisco не подключён). */
     fun checkGitLabNow() { gitlabWake.trySend(Unit) }
 
+    /** Открыть выбранный MR внутри вкладки GitLab и загрузить его детали. */
+    fun openGitLabMr(mr: MergeRequest) {
+        selectedGitLabMr = mr
+        gitlabMrDetails = null
+        gitlabMrError = null
+        gitlabMrActionMessage = null
+        gitlabMrLoading = true
+        gitlabMrJob?.cancel()
+        gitlabMrJob = scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    gitlabClient().mergeRequestDetails(mr)
+                }
+            }
+            if (selectedGitLabMr?.key != mr.key) return@launch
+            gitlabMrLoading = false
+            result.onSuccess { gitlabMrDetails = it }
+                .onFailure { gitlabMrError = it.message ?: it.javaClass.simpleName }
+        }
+    }
+
+    fun closeGitLabMr() {
+        gitlabMrJob?.cancel()
+        selectedGitLabMr = null
+        gitlabMrDetails = null
+        gitlabMrError = null
+        gitlabMrLoading = false
+        gitlabMrActionMessage = null
+    }
+
+    fun commentGitLabMr(mr: MergeRequest, body: String) {
+        val text = body.trim()
+        if (text.isEmpty() || gitlabMrActionBusy) return
+        gitlabMrActionBusy = true
+        gitlabMrActionMessage = null
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val client = gitlabClient()
+                    client.addMergeRequestNote(mr, text)
+                    runCatching { client.mergeRequestDetails(mr) }.getOrNull()
+                }
+            }
+            gitlabMrActionBusy = false
+            result.onSuccess {
+                if (it != null && selectedGitLabMr?.key == mr.key) gitlabMrDetails = it
+                gitlabMrActionMessage = "Комментарий отправлен в GitLab"
+            }
+                .onFailure { gitlabMrActionMessage = it.message ?: "Не удалось отправить комментарий" }
+        }
+    }
+
+    fun commentGitLabMrDiff(
+        mr: MergeRequest, body: String, refs: GitLabDiffRefs, change: GitLabChange,
+        oldLine: Int?, newLine: Int?,
+    ) {
+        val text = body.trim()
+        if (text.isEmpty() || gitlabMrActionBusy) return
+        gitlabMrActionBusy = true
+        gitlabMrActionMessage = null
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    gitlabClient().addMergeRequestDiffNote(mr, text, refs, change.oldPath, change.newPath, oldLine, newLine)
+                }
+            }
+            gitlabMrActionBusy = false
+            result.onSuccess { gitlabMrActionMessage = "Комментарий к строке отправлен в GitLab" }
+                .onFailure { gitlabMrActionMessage = it.message ?: "Не удалось отправить комментарий к строке" }
+        }
+    }
+
+    fun replyGitLabMrDiscussion(mr: MergeRequest, thread: GitLabDiscussionThread, body: String) {
+        val text = body.trim()
+        if (text.isEmpty() || gitlabMrActionBusy) return
+        gitlabMrActionBusy = true
+        gitlabMrActionMessage = null
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val client = gitlabClient()
+                    client.replyToMergeRequestDiscussion(mr, thread.id, text)
+                    client.mergeRequestDetails(mr)
+                }
+            }
+            gitlabMrActionBusy = false
+            result.onSuccess {
+                if (selectedGitLabMr?.key == mr.key) gitlabMrDetails = it
+                gitlabMrActionMessage = "Ответ отправлен в обсуждение"
+            }.onFailure { gitlabMrActionMessage = it.message ?: "Не удалось ответить в обсуждение" }
+        }
+    }
+
+    fun resolveGitLabMrDiscussion(mr: MergeRequest, thread: GitLabDiscussionThread, resolved: Boolean) {
+        if (gitlabMrActionBusy) return
+        gitlabMrActionBusy = true
+        gitlabMrActionMessage = null
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val client = gitlabClient()
+                    client.resolveMergeRequestDiscussion(mr, thread.id, resolved)
+                    client.mergeRequestDetails(mr)
+                }
+            }
+            gitlabMrActionBusy = false
+            result.onSuccess {
+                if (selectedGitLabMr?.key == mr.key) gitlabMrDetails = it
+                gitlabMrActionMessage = if (resolved) "Обсуждение решено" else "Обсуждение снова открыто"
+            }.onFailure { gitlabMrActionMessage = it.message ?: "Не удалось изменить состояние обсуждения" }
+        }
+    }
+
+    fun setGitLabMrApproval(mr: MergeRequest, approve: Boolean) {
+        if (gitlabMrActionBusy) return
+        gitlabMrActionBusy = true
+        gitlabMrActionMessage = null
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val client = gitlabClient()
+                    client.setMergeRequestApproval(mr, approve)
+                    client.mergeRequestDetails(mr)
+                }
+            }
+            gitlabMrActionBusy = false
+            result.onSuccess {
+                if (selectedGitLabMr?.key == mr.key) gitlabMrDetails = it
+                gitlabMrActionMessage = if (approve) "Review отправлен: MR одобрен" else "Одобрение снято"
+            }.onFailure { gitlabMrActionMessage = it.message ?: "Не удалось отправить review" }
+        }
+    }
+
+    private fun gitlabClient(): GitLabClient {
+        val token = secrets.get(SecretStore.GITLAB_TOKEN) ?: error("Токен GitLab не найден в Связке ключей")
+        return gitlabClient ?: GitLabClient(token, secrets.get(SecretStore.GITLAB_WRITE_TOKEN)).also { gitlabClient = it }
+    }
+
     fun saveGitLabToken(value: String) {
         gitlabClient = null
         saveSecret(SecretStore.GITLAB_TOKEN, value.trim()) { hasGitLabToken = it }
         checkGitLabNow()
+    }
+
+    fun saveGitLabWriteToken(value: String) {
+        gitlabClient = null
+        saveSecret(SecretStore.GITLAB_WRITE_TOKEN, value.trim()) { hasGitLabWriteToken = it }
     }
 
     /**
@@ -183,8 +342,10 @@ class AppState(private val scope: CoroutineScope) {
                         gitlabChecking = true
                         val r = runCatching {
                             withContext(Dispatchers.IO) {
-                                val c = gitlabClient ?: GitLabClient(secrets.get(SecretStore.GITLAB_TOKEN)
-                                    ?: error("Токен GitLab не найден в Связке ключей")).also { gitlabClient = it }
+                                val c = gitlabClient ?: GitLabClient(
+                                    secrets.get(SecretStore.GITLAB_TOKEN) ?: error("Токен GitLab не найден в Связке ключей"),
+                                    secrets.get(SecretStore.GITLAB_WRITE_TOKEN),
+                                ).also { gitlabClient = it }
                                 lists.map { (url, list) -> url to c.mergeRequests(list) }
                             }
                         }
@@ -305,6 +466,7 @@ class AppState(private val scope: CoroutineScope) {
         if (phase == Phase.RUNNING && old.abroad != new.abroad) restartNeeded = true
         if (!old.gitlab.enabled && new.gitlab.enabled) checkGitLabNow()
         if (old.jira.enabled != new.jira.enabled || old.jira.boardUrl != new.jira.boardUrl) jira.settingsChanged()
+        if (old.jira.assignmentNotifications != new.jira.assignmentNotifications) jira.assignmentNotificationsChanged()
     }
 
     /** Российские серверы, которые возьмёт Run в режиме «из-за рубежа». */
@@ -398,6 +560,7 @@ class AppState(private val scope: CoroutineScope) {
         if (phase == Phase.STOPPED || phase == Phase.STOPPING) return
         phase = Phase.STOPPING
         monitorJob?.cancel()
+        serverCheckJob?.cancel()
         scope.launch {
             withContext(Dispatchers.IO) { runCatching { c.stop() } }
             ciscoUp = false
@@ -450,6 +613,7 @@ class AppState(private val scope: CoroutineScope) {
             SecretStore.CISCO_PASSWORD -> hasPassword = false
             SecretStore.CISCO_TOTP -> { totpSecretCache = null; hasTotp = false }
             SecretStore.GITLAB_TOKEN -> { gitlabClient = null; hasGitLabToken = false }
+            SecretStore.GITLAB_WRITE_TOKEN -> { gitlabClient = null; hasGitLabWriteToken = false }
             SecretStore.JIRA_TOKEN -> jira.forgetToken()
         }
     }
@@ -484,7 +648,14 @@ class AppState(private val scope: CoroutineScope) {
 
     private fun startMonitor() {
         monitorJob?.cancel()
+        serverCheckJob?.cancel()
         val c = controller ?: return
+        serverCheckJob = scope.launch {
+            while (isActive && phase == Phase.RUNNING) {
+                withContext(Dispatchers.IO) { c.checkServerAvailability() }
+                delay(20_000)
+            }
+        }
         monitorJob = scope.launch {
             var deadChecks = 0
             while (isActive) {

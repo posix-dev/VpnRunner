@@ -18,6 +18,7 @@ object SingBoxConfig {
     const val PROXY_TAG = "proxy"
     const val AUTO_TAG = "auto"
     const val DIRECT_TAG = "direct"
+    val SERVER_PROBE_URLS = listOf("https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204")
 
     /** Адрес TUN sing-box и DNS внутри него: этот DNS система получает как основной (см. супервизор на macOS). */
     const val TUN_ADDRESS = "172.19.0.1"
@@ -32,6 +33,17 @@ object SingBoxConfig {
     )
 
     fun tagFor(server: Server) = "${server.subscription} | ${server.name}"
+
+    /** Локальная проверка серверов до включения TUN, без маршрутов системы и кэша. */
+    fun buildServerProbe(servers: List<Server>, api: String): Map<String, Any?> = linkedMapOf(
+        "outbounds" to servers.map { it.outbound + ("tag" to tagFor(it)) },
+        "dns" to linkedMapOf(
+            "servers" to listOf(linkedMapOf("type" to "udp", "tag" to "dns-direct", "server" to "77.88.8.8")),
+            "strategy" to "ipv4_only",
+        ),
+        "route" to linkedMapOf("default_domain_resolver" to "dns-direct", "auto_detect_interface" to true),
+        "experimental" to linkedMapOf("clash_api" to linkedMapOf("external_controller" to api)),
+    )
 
     fun build(
         settings: AppSettings,
@@ -195,7 +207,7 @@ object SingBoxConfig {
         }
         outbounds.add(linkedMapOf(
             "type" to "urltest", "tag" to AUTO_TAG, "outbounds" to serverTags,
-            "url" to "https://www.gstatic.com/generate_204", "interval" to "3m", "tolerance" to 100,
+            "url" to SERVER_PROBE_URLS.first(), "interval" to "3m", "tolerance" to 100,
         ))
         val selected = servers.firstOrNull { it.id == selectedId }?.let { tagFor(it) } ?: AUTO_TAG
         outbounds.add(linkedMapOf(

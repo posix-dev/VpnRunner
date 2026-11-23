@@ -14,7 +14,9 @@ import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import vpnrunner.platform.KeepAwake
 import vpnrunner.ui.*
+import java.awt.Taskbar
 import java.io.File
+import javax.imageio.ImageIO
 import kotlin.system.exitProcess
 
 fun main() {
@@ -57,10 +59,24 @@ private fun relaunchOnJcefJava() {
 private fun app() = application {
     val scope = rememberCoroutineScope()
     val state = remember { AppState(scope) }
+    installDockIcon()
     val windowState = rememberWindowState(size = DpSize(560.dp, 720.dp))
+    val reviewWindowSize = DpSize(1000.dp, 820.dp)
+    var sizeBeforeReview by remember { mutableStateOf<DpSize?>(null) }
+    LaunchedEffect(state.selectedGitLabMr) {
+        if (state.selectedGitLabMr != null) {
+            if (sizeBeforeReview == null) sizeBeforeReview = windowState.size
+            windowState.size = reviewWindowSize
+        } else {
+            sizeBeforeReview?.let { previous ->
+                if (windowState.size == reviewWindowSize) windowState.size = previous
+            }
+            sizeBeforeReview = null
+        }
+    }
     var windowVisible by remember { mutableStateOf(true) }
     val trayState = rememberTrayState()
-    // Напоминания о рабочем времени и новые merge request — уведомлением macOS / Windows от значка
+    // Рабочие напоминания, новые MR и назначения Jira — уведомлением macOS / Windows от значка
     LaunchedEffect(Unit) {
         state.notifications.collect {
             trayState.sendNotification(Notification(it.title, it.text, if (it.warning) Notification.Type.Warning else Notification.Type.Info))
@@ -77,10 +93,10 @@ private fun app() = application {
         exitApplication()
     }
 
-    // Значок в строке меню: серый — выключено, жёлтый — подключается, зелёный — работает.
+    // Знак VpnRunner в строке меню меняет цвет по состоянию подключения.
     Tray(
         state = trayState,
-        icon = TrayIcon.forPhase(state.phase),
+        icon = AppIconPainter.forPhase(state.phase),
         tooltip = when (state.phase) {
             Phase.STOPPED -> "VpnRunner — выключен"
             Phase.STARTING -> "VpnRunner — подключается…"
@@ -103,6 +119,7 @@ private fun app() = application {
         onCloseRequest = { windowVisible = false },
         visible = windowVisible,
         title = "VpnRunner",
+        icon = AppIconPainter.Window,
         state = windowState,
     ) {
         LaunchedEffect(windowVisible) { if (windowVisible) window.toFront() }
@@ -120,5 +137,17 @@ private fun app() = application {
                 AppScreen(state)
             }
         }
+    }
+}
+
+/** Gradle/IDE-запуск не использует .app bundle, поэтому явно задаём значок Dock через AWT. */
+private fun installDockIcon() {
+    if (vpnrunner.platform.Platform.os != vpnrunner.platform.Os.MAC) return
+    runCatching {
+        if (!Taskbar.isTaskbarSupported()) return
+        val taskbar = Taskbar.getTaskbar()
+        if (!taskbar.isSupported(Taskbar.Feature.ICON_IMAGE)) return
+        val image = AppIconPainter::class.java.getResourceAsStream("/vpnrunner.png")?.use { ImageIO.read(it) } ?: return
+        taskbar.setIconImage(image)
     }
 }

@@ -13,7 +13,10 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 
 /** Строка списка: задача и откуда она взялась (спринт, «в работе», MR в GitLab) — каждая задача один раз. manual — добавлена по ключу. */
-data class JiraRow(val issue: JiraIssue, val inSprint: Boolean, val tags: List<String>, val manual: Boolean = false)
+data class JiraRow(
+    val issue: JiraIssue, val inSprint: Boolean, val tags: List<String>,
+    val manual: Boolean = false, val assignmentNew: Boolean = false,
+)
 
 /** Сертификат Jira, которому пользователь может решить доверять. */
 class CertOffer(val host: String, val cert: X509Certificate) {
@@ -26,7 +29,7 @@ class CertOffer(val host: String, val cert: X509Certificate) {
  * Jira во внутренней сети — обновляемся раз в 10 минут, пока подключён Cisco (и по кнопке).
  */
 class JiraState(private val app: AppState, private val scope: CoroutineScope) {
-    var hasToken by mutableStateOf(app.secrets.get(SecretStore.JIRA_TOKEN) != null)
+    var hasToken by mutableStateOf(app.secrets.contains(SecretStore.JIRA_TOKEN))
         private set
     var status by mutableStateOf<String?>(null)
         private set
@@ -40,6 +43,8 @@ class JiraState(private val app: AppState, private val scope: CoroutineScope) {
     var sprintId by mutableStateOf<Long?>(null)
         private set
     var rows by mutableStateOf<List<JiraRow>>(emptyList())
+        private set
+    var pendingAssignmentKeys by mutableStateOf(emptySet<String>())
         private set
     /** Задача-контейнер спринта (свежие данные из Jira), если отмечена. */
     var container by mutableStateOf<JiraIssue?>(null)
@@ -78,6 +83,8 @@ class JiraState(private val app: AppState, private val scope: CoroutineScope) {
     val sprint: JiraSprint? get() = sprints.firstOrNull { it.id == sprintId }
 
     private val caFile = File(Platform.appDir, "jira-ca.pem")
+    private val assignmentWatchFile = File(Platform.appDir, "jira-assigned.json")
+    private var assignmentWatch = JiraAssignmentWatch.load(assignmentWatchFile)
     private val workLog = WorkLog(File(Platform.appDir, "work-days.json"))
     // Токены читаем из Связки ключей один раз: иначе каждые 10 минут запускалась бы утилита security.
     private var client: Pair<String, JiraClient>? = null
@@ -87,8 +94,10 @@ class JiraState(private val app: AppState, private val scope: CoroutineScope) {
     private val wake = Channel<Unit>(Channel.CONFLATED)
     private var remindedDay: LocalDate? = null
     private var lastError: String? = null
+    private var lastAssignmentError: String? = null
 
     fun start() {
+        pendingAssignmentKeys = assignmentWatch.pendingKeys.toSet()
         scope.launch {
             delay(4000) // дать трекеру рабочего времени узнать, подключён ли Cisco
             var force = false
@@ -96,6 +105,63 @@ class JiraState(private val app: AppState, private val scope: CoroutineScope) {
                 val ok = runOnce(force)
                 force = withTimeoutOrNull(if (ok) 600_000L else 60_000L) { wake.receive() } != null
             }
+        }
+        scope.launch {
+            delay(7000)
+            while (isActive) {
+                checkAssignments()
+                delay(120_000)
+            }
+        }
+    }
+
+    /** Убрать метку «новая» после того, как пользователь открыл задачу. */
+    fun acknowledgeAssignment(key: String) {
+        if (key !in pendingAssignmentKeys) return
+        assignmentWatch = assignmentWatch.copy(pendingKeys = assignmentWatch.pendingKeys - key)
+        pendingAssignmentKeys = assignmentWatch.pendingKeys.toSet()
+        val snapshot = assignmentWatch
+        scope.launch(Dispatchers.IO) { snapshot.save(assignmentWatchFile) }
+        rows = rows.map { if (it.issue.key == key) it.copy(assignmentNew = false) else it }
+    }
+
+    /** Jira проверяется отдельно от таблиц Tempo, чтобы список списаний не обновлялся каждые две минуты. */
+    private suspend fun checkAssignments() {
+        val j = app.settings.jira
+        val b = board ?: return
+        if (!j.assignmentNotifications || !hasToken || certOffer != null) return
+        if (app.settings.cisco.enabled && !app.workVpnUp) return
+        val now = WorkClock.now().toLocalDateTime().withSecond(0).withNano(0)
+        val previous = assignmentWatch
+        val result = runCatching {
+            withContext(Dispatchers.IO) {
+                val c = client()
+                if (!previous.initialized) {
+                    c.search("assignee = currentUser() AND issuetype not in subTaskIssueTypes() ORDER BY updated DESC", 500)
+                } else {
+                    val from = runCatching { java.time.LocalDateTime.parse(previous.lastChecked).minusMinutes(2) }.getOrDefault(now.minusMinutes(2))
+                    c.assignedToMeSince(from)
+                }
+            }
+        }
+        result.onSuccess { found ->
+            val fresh = if (previous.initialized) found.filter { it.key !in previous.knownKeys } else emptyList()
+            val known = (previous.knownKeys + found.map { it.key }).distinct().takeLast(2000)
+            val pending = (previous.pendingKeys + fresh.map { it.key }).distinct().takeLast(200)
+            assignmentWatch = JiraAssignmentWatch(true, now.toString(), known, pending)
+            pendingAssignmentKeys = pending.toSet()
+            val snapshot = assignmentWatch
+            scope.launch(Dispatchers.IO) { snapshot.save(assignmentWatchFile) }
+            fresh.forEach { issue ->
+                if (rows.none { it.issue.key == issue.key }) rows = rows + JiraRow(issue, false, listOf("назначена недавно"), assignmentNew = true)
+                else rows = rows.map { row -> if (row.issue.key == issue.key) row.copy(assignmentNew = true) else row }
+            }
+            if (fresh.size > 3) app.notice(Notice("Новых задач Jira: ${fresh.size}", fresh.take(3).joinToString("\n") { "${it.key} ${it.summary}" } + "\n…", warning = false))
+            else fresh.forEach { issue -> app.notice(Notice("Вам назначили ${issue.key}", issue.summary, warning = false)) }
+        }.onFailure { error ->
+            val message = error.message ?: error.javaClass.simpleName
+            if (lastAssignmentError != message) app.log("Jira: проверка новых назначений — $message")
+            lastAssignmentError = message
         }
     }
 
@@ -262,6 +328,14 @@ class JiraState(private val app: AppState, private val scope: CoroutineScope) {
         refresh()
     }
 
+    /** После повторного включения уведомлений начинаем с исходного списка, без пачки старых новостей. */
+    fun assignmentNotificationsChanged() {
+        assignmentWatch = assignmentWatch.copy(initialized = false, lastChecked = "")
+        val snapshot = assignmentWatch
+        scope.launch(Dispatchers.IO) { snapshot.save(assignmentWatchFile) }
+        refresh()
+    }
+
     fun trustCert() {
         val o = certOffer ?: return
         runCatching { JiraTrust.save(o.cert, caFile) }
@@ -366,7 +440,7 @@ class JiraState(private val app: AppState, private val scope: CoroutineScope) {
         val j = app.settings.jira
         val b = board
         when {
-            !j.enabled -> { status = null; return false }
+            !j.enabled && !j.assignmentNotifications -> { status = null; return false }
             b == null -> { status = "Вставьте ссылку на доску Jira"; return false }
             !hasToken -> { status = "Сохраните токен Jira"; return false }
             certOffer != null -> { status = "Подтвердите сертификат Jira"; return false }
@@ -387,8 +461,10 @@ class JiraState(private val app: AppState, private val scope: CoroutineScope) {
             s.attributes?.let { attributes = it; attributesLoaded = true }
             status = "Обновлено в ${LocalTime.now().format(WorkClock.HHMM)}"
             lastError = null
-            autoContainer(s)
-            remind()
+            if (j.enabled) {
+                autoContainer(s)
+                remind()
+            }
             return true
         }
         val e = r.exceptionOrNull()!!
@@ -448,6 +524,11 @@ class JiraState(private val app: AppState, private val scope: CoroutineScope) {
             val r = rows[key]
             if (r != null) rows[key] = r.copy(tags = (r.tags + MANUAL).distinct(), manual = true)
             else c.issue(key)?.let { rows[key] = JiraRow(it, false, listOf(MANUAL), manual = true) }
+        }
+        assignmentWatch.pendingKeys.forEach { key ->
+            if (key !in rows && key != j.container?.issueKey) c.issue(key)?.let {
+                rows[key] = JiraRow(it, false, listOf("назначена недавно"), assignmentNew = true)
+            } else rows[key]?.let { rows[key] = it.copy(assignmentNew = true) }
         }
         val cont = j.container?.let { k -> rows.remove(k.issueKey)?.issue ?: c.issue(k.issueKey) }
 

@@ -1,5 +1,6 @@
 package vpnrunner.ui
 
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -9,49 +10,50 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.painter.Painter
 
-/**
- * Значок в строке меню — щит. Рисуется кодом, без файлов картинок.
- *  - выключено: серый контур (виден и на светлой, и на тёмной строке меню);
- *  - подключается / отключается: жёлтый щит;
- *  - работает: зелёный щит с галочкой.
- */
-class TrayIcon private constructor(private val color: Color, private val filled: Boolean, private val check: Boolean) : Painter() {
-
+/** Рисуем знак VpnRunner без зависимости от растровых файлов в окне и строке меню. */
+class AppIconPainter(
+    private val background: Color?,
+    private val vColor: Color,
+    private val routeColor: Color,
+    private val circleBackground: Boolean = false,
+) : Painter() {
     override val intrinsicSize = Size(64f, 64f)
 
     override fun DrawScope.onDraw() {
         val w = size.width
         val h = size.height
-        val shield = Path().apply {
-            moveTo(w * 0.50f, h * 0.06f)
-            lineTo(w * 0.86f, h * 0.19f)
-            lineTo(w * 0.86f, h * 0.47f)
-            cubicTo(w * 0.86f, h * 0.71f, w * 0.70f, h * 0.87f, w * 0.50f, h * 0.95f)
-            cubicTo(w * 0.30f, h * 0.87f, w * 0.14f, h * 0.71f, w * 0.14f, h * 0.47f)
-            lineTo(w * 0.14f, h * 0.19f)
-            close()
+        background?.let {
+            if (circleBackground) drawCircle(it)
+            else drawRoundRect(it, cornerRadius = CornerRadius(w * 0.2f, h * 0.2f))
         }
-        if (filled) drawPath(shield, color)
-        else drawPath(shield, color, style = Stroke(width = w * 0.09f, join = StrokeJoin.Round))
-        if (check) {
-            val mark = Path().apply {
-                moveTo(w * 0.32f, h * 0.50f)
-                lineTo(w * 0.45f, h * 0.63f)
-                lineTo(w * 0.69f, h * 0.37f)
-            }
-            drawPath(mark, Color.White, style = Stroke(width = w * 0.09f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+
+        val v = Path().apply {
+            moveTo(w * 0.28f, h * 0.205f)
+            lineTo(w * 0.422f, h * 0.717f)
+            quadraticTo(w * 0.46f, h * 0.768f, w * 0.49f, h * 0.717f)
+            lineTo(w * 0.633f, h * 0.205f)
         }
+        drawPath(v, vColor, style = Stroke(width = w * 0.086f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+
+        val route = Path().apply {
+            moveTo(w * 0.684f, h * 0.393f)
+            lineTo(w * 0.844f, h * 0.5f)
+            lineTo(w * 0.684f, h * 0.607f)
+        }
+        drawPath(route, routeColor, style = Stroke(width = w * 0.08f, cap = StrokeCap.Round, join = StrokeJoin.Round))
     }
 
     companion object {
-        val Off = TrayIcon(Color(0xFF8E8E93), filled = false, check = false)
-        val Busy = TrayIcon(Color(0xFFF2B200), filled = true, check = false)
-        val On = TrayIcon(Color(0xFF2FB344), filled = true, check = true)
+        private val tile = Color(0xFF202735)
+        private val blue = Color(0xFF86A6FF)
+        private val green = Color(0xFF70D99A)
+
+        val Window = AppIconPainter(tile, blue, green)
 
         fun forPhase(phase: Phase) = when (phase) {
-            Phase.STOPPED -> Off
-            Phase.STARTING, Phase.STOPPING -> Busy
-            Phase.RUNNING -> On
+            Phase.STOPPED -> AppIconPainter(Color(0xFF8E8E93), Color.White, Color.White, circleBackground = true)
+            Phase.STARTING, Phase.STOPPING -> AppIconPainter(Color(0xFFD9922B), Color.White, Color.White, circleBackground = true)
+            Phase.RUNNING -> AppIconPainter(Color(0xFF2E9E5B), Color.White, Color.White, circleBackground = true)
         }
     }
 }

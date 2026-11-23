@@ -3,6 +3,7 @@ package vpnrunner.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.focus.onFocusChanged
@@ -24,7 +25,6 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -41,9 +41,10 @@ private val Done = Color(0xFF2E9E5B)
 fun JiraTab(state: AppState, onOpen: (String) -> Unit) {
     val js = state.jira
     val j = state.settings.jira
-    val configured = j.enabled && js.board != null && js.hasToken
+    val configured = (j.enabled || j.assignmentNotifications) && js.board != null && js.hasToken
     var showSettings by remember { mutableStateOf(false) }
     var expanded by remember { mutableStateOf<String?>(null) }
+    var page by remember { mutableStateOf(0) }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         js.certOffer?.let { CertCard(it) { js.trustCert() } }
@@ -52,34 +53,72 @@ fun JiraTab(state: AppState, onOpen: (String) -> Unit) {
             HorizontalDivider()
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(js.status ?: "Списание времени выключено", Modifier.weight(1f), fontSize = 13.sp,
+            Text(js.status ?: when {
+                j.enabled -> "Настроена Jira"
+                j.assignmentNotifications -> "Списание выключено · уведомления включены"
+                else -> "Jira выключена"
+            }, Modifier.weight(1f), fontSize = 13.sp,
                 color = if (js.status?.startsWith("Ошибка") == true) MaterialTheme.colorScheme.error else Muted)
             if (js.loading) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
             else TextButton(onClick = { js.refresh() }, enabled = configured) { Text("Обновить") }
         }
         if (configured && js.sprints.isNotEmpty()) {
-            ViewAndSprint(js)
-            if (js.weekView) {
-                WeekNav(js)
-                DefaultAttributes(state)
-                WeekGrid(state, onOpen)
-                AddIssueField(js)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = page == 0, onClick = { page = 0 }, label = { Text("Задачи${js.pendingAssignmentKeys.size.takeIf { it > 0 }?.let { " · $it новых" } ?: ""}") })
+                FilterChip(selected = page == 1, onClick = { page = 1 }, label = { Text("Списание") })
+            }
+            if (page == 0) {
+                SprintPicker(js)
+                JiraTaskList(state, expanded, { key -> if (key != null) js.acknowledgeAssignment(key); expanded = key }, onOpen)
+            } else if (!j.enabled) {
+                Text("Списание времени выключено. Включите его в настройках Jira, чтобы менять списания через Tempo.",
+                    fontSize = 12.sp, color = Muted)
             } else {
-                DayNav(js)
-                DaySummary(state)
-                ContainerCard(state)
-                AddIssueField(js)
-                LaunchedEffect(js.justAdded) { js.justAdded?.let { expanded = it } }
-                val (inSprint, other) = js.rows.partition { it.inSprint }
-                Section("Спринт · на мне", inSprint, "В этом спринте на вас задач нет", state, expanded, { expanded = it }, onOpen)
-                if (other.isNotEmpty()) Section("Вне спринта", other, null, state, expanded, { expanded = it }, onOpen)
-                DayLogs(js)
+                ViewAndSprint(js)
+                if (js.weekView) {
+                    WeekNav(js)
+                    DefaultAttributes(state)
+                    WeekGrid(state, onOpen)
+                    AddIssueField(js)
+                } else {
+                    DayNav(js)
+                    DaySummary(state)
+                    ContainerCard(state)
+                    AddIssueField(js)
+                    LaunchedEffect(js.justAdded) { js.justAdded?.let { expanded = it } }
+                    val (inSprint, other) = js.rows.partition { it.inSprint }
+                    Section("Спринт · на мне", inSprint, "В этом спринте на вас задач нет", state, expanded, { expanded = it }, onOpen)
+                    if (other.isNotEmpty()) Section("Вне спринта", other, null, state, expanded, { expanded = it }, onOpen)
+                    DayLogs(js)
+                }
             }
         }
         if (configured) TextButton(onClick = { showSettings = !showSettings }) {
             Text(if (showSettings) "Скрыть настройки" else "Настройки Jira")
         }
     }
+}
+
+@Composable
+private fun JiraTaskList(state: AppState, expanded: String?, onExpand: (String?) -> Unit, onOpen: (String) -> Unit) {
+    val js = state.jira
+    var query by remember { mutableStateOf("") }
+    val filtered = js.rows.filter { row ->
+        val q = query.trim().lowercase()
+        q.isBlank() || row.issue.key.lowercase().contains(q) || row.issue.summary.lowercase().contains(q)
+    }
+    val newRows = filtered.filter { it.assignmentNew }
+    val sprintRows = filtered.filter { it.inSprint && !it.assignmentNew }
+    val otherRows = filtered.filter { !it.inSprint && !it.assignmentNew }
+    OutlinedTextField(
+        value = query, onValueChange = { query = it }, singleLine = true,
+        label = { Text("Найти задачу в спринте") }, placeholder = { Text("Ключ или название") },
+        modifier = Modifier.fillMaxWidth(),
+    )
+    Section("Новые назначения", newRows, "Новых назначений пока нет", state, expanded, onExpand, onOpen)
+    Section("Задачи спринта", sprintRows, "В спринте на вас задач нет", state, expanded, onExpand, onOpen)
+    if (otherRows.isNotEmpty()) Section("Другие задачи", otherRows, null, state, expanded, onExpand, onOpen)
+    AddIssueField(js)
 }
 
 // ---------------------------------------------------------------- настройки
@@ -98,6 +137,13 @@ private fun JiraSettingsBlock(state: AppState) {
                     fontSize = 12.sp, color = Muted)
             }
             Switch(checked = j.enabled, onCheckedChange = { v -> upd { it.copy(enabled = v) } })
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Уведомлять о новых назначениях")
+                Text("Работает независимо от списания времени, когда настроены Jira и Cisco", fontSize = 12.sp, color = Muted)
+            }
+            Switch(checked = j.assignmentNotifications, onCheckedChange = { v -> upd { it.copy(assignmentNotifications = v) } })
         }
         OutlinedTextField(
             value = j.boardUrl, onValueChange = { v -> upd { it.copy(boardUrl = v.trim()) } }, singleLine = true,
@@ -142,7 +188,7 @@ private fun CertCard(o: CertOffer, onTrust: () -> Unit) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             val c = MaterialTheme.colorScheme.onErrorContainer
             Text("Jira (${o.host}) подписана сертификатом «${o.name}» — его нет среди известных центров сертификации.", fontSize = 13.sp, color = c)
-            SelectionContainer { Text("SHA-256: ${o.sha256}", fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = c) }
+            SelectionContainer { Text("SHA-256: ${o.sha256}", fontSize = 11.sp, fontFamily = PlexMonoFamily, color = c) }
             Text("Доверяйте, только если это корневой сертификат вашей компании (отпечаток можно сверить с IT). " +
                 "Доверие действует только для запросов программы к Jira.", fontSize = 12.sp, color = c)
             Button(onClick = onTrust) { Text("Доверять") }
@@ -160,6 +206,21 @@ private fun dayLabel(d: LocalDate): String {
         today -> "Сегодня, ${d.format(JiraState.DM)}"
         today.minusDays(1) -> "Вчера, ${d.format(JiraState.DM)}"
         else -> d.format(dayFmt)
+    }
+}
+
+@Composable
+private fun SprintPicker(js: JiraState) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        OutlinedButton(onClick = { open = true }) {
+            Text((js.sprint?.let { sprintTitle(it) } ?: "Спринт") + "  ▾", maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            js.sprints.forEach { s ->
+                DropdownMenuItem(text = { Text(sprintTitle(s) + if (s.active) "" else " · будущий") }, onClick = { open = false; js.selectSprint(s.id) })
+            }
+        }
     }
 }
 
@@ -226,7 +287,7 @@ private fun ContainerCard(state: AppState) {
         Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Контейнер спринта · ", fontSize = 13.sp, color = Muted)
-                Text(k.issueKey, fontSize = 13.sp, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.primary)
+                Text(k.issueKey, fontSize = 13.sp, fontFamily = PlexMonoFamily, color = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.weight(1f))
                 Checkbox(checked = true, onCheckedChange = { js.markContainer(null) })
             }
@@ -248,6 +309,17 @@ private fun AddIssueField(js: JiraState) {
     var text by remember { mutableStateOf("") }
     fun add() { if (text.isNotBlank()) { js.addIssue(text); text = "" } }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        val knownProjects = remember(js.rows, js.weekLogs, js.board?.projectKey, js.container) {
+            val observed = (js.rows.map { it.issue.key } + js.weekLogs.map { it.issueKey } + listOfNotNull(js.board?.projectKey, js.container?.key))
+                .mapNotNull { it.substringBefore('-').takeIf { key -> key.matches(Regex("[A-Z][A-Z0-9]+")) } }
+                .toSet()
+            listOf("MORGHUL", "SYRAX") + (observed - setOf("MORGHUL", "SYRAX")).sorted()
+        }
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            knownProjects.forEach { project ->
+                SuggestionChip(onClick = { text = "$project-" }, label = { Text(project) })
+            }
+        }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
                 text, { text = it }, singleLine = true,
@@ -280,12 +352,14 @@ private fun Section(
 @Composable
 private fun IssueRow(row: JiraRow, state: AppState, expanded: Boolean, onToggle: () -> Unit, onOpen: (String) -> Unit, onLogged: () -> Unit) {
     val i = row.issue
-    val over = i.original != null && i.original > 0 && i.spent > i.original
+    val original = i.original
+    val over = original != null && original > 0 && i.spent > original
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.clickable { onToggle() }.padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(i.key, fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.primary)
+                Text(i.key, fontSize = 12.sp, fontFamily = PlexMonoFamily, color = MaterialTheme.colorScheme.primary)
                 Text(i.summary, Modifier.weight(1f), fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                if (row.assignmentNew) Text("новая", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
                 Text(i.status, fontSize = 11.sp, color = Muted, maxLines = 1)
             }
             if (row.tags.isNotEmpty()) Text(row.tags.joinToString(" · "), fontSize = 11.sp, color = Muted)
@@ -303,7 +377,8 @@ private fun IssueRow(row: JiraRow, state: AppState, expanded: Boolean, onToggle:
 private fun timeLine(i: JiraIssue): String {
     val spent = if (i.spent > 0) "списано ${WorkTime.text(i.spent)}" else "без списаний"
     val of = i.original?.takeIf { it > 0 && i.spent > 0 }?.let { " из ${WorkTime.text(it)}" } ?: ""
-    return if (i.remaining == null) "без оценки · $spent" else "осталось ${WorkTime.text(i.remaining)} · $spent$of"
+    val remaining = i.remaining
+    return if (remaining == null) "без оценки · $spent" else "осталось ${WorkTime.text(remaining)} · $spent$of"
 }
 
 /** «0», «0h», «0м» — оставшаяся оценка ноль (WorkTime.parse ноль не принимает: списать 0 нельзя). */
@@ -388,7 +463,7 @@ private fun DayLogs(js: JiraState) {
     var confirm by remember { mutableStateOf<Long?>(null) }
     js.dayLogs.forEach { w ->
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(w.issueKey, fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.primary)
+            Text(w.issueKey, fontSize = 12.sp, fontFamily = PlexMonoFamily, color = MaterialTheme.colorScheme.primary)
             Text(WorkTime.text(w.seconds), fontSize = 13.sp)
             Text(w.comment.ifBlank { w.issueSummary }, Modifier.weight(1f), fontSize = 12.sp, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             if (confirm == w.id) {
@@ -571,11 +646,12 @@ private fun WeekGrid(state: AppState, onOpen: (String) -> Unit) {
 @Composable
 private fun WeekRow(issue: JiraIssue, label: String?, days: List<LocalDate>, js: JiraState, today: LocalDate, onOpen: (String) -> Unit) {
     val mine = js.weekLogs.filter { it.issueKey == issue.key }
-    val over = issue.original != null && issue.original > 0 && issue.spent > issue.original
+    val original = issue.original
+    val over = original != null && original > 0 && issue.spent > original
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 3.dp)) {
         Column(Modifier.weight(1f).padding(end = 4.dp)) {
             Row {
-                Text(issue.key, fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.primary,
+                Text(issue.key, fontSize = 11.sp, fontFamily = PlexMonoFamily, color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.clickable { js.board?.let { onOpen("${it.host}/browse/${issue.key}") } })
                 label?.let { Text("  $it", fontSize = 11.sp, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis) }
             }
